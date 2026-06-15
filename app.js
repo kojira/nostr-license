@@ -212,14 +212,15 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
   const notes0 = await queryRelays([{ kinds: [1], authors: [t], limit: 500 }], { relays: working });
   const seedMin = notes0.length ? Math.min(...notes0.map((e) => e.created_at)) : (meta ? meta.created_at : null);
 
-  // ページング取得（リレー上限を越えて過去も）＋最古推定を並列実行
-  const [noteEvents, followerEvents, zapRecvEvents, zapSentEvents, contactsEvents, sinceAt] = await Promise.all([
+  // ページング取得（リレー上限を越えて過去も）＋最古推定＋NIP-05検証を並列実行
+  const [noteEvents, followerEvents, zapRecvEvents, zapSentEvents, contactsEvents, sinceAt, nip05Verified] = await Promise.all([
     fetchAllPaged({ kinds: [1], authors: [t] }, working, { maxPages: 5 }),
     fetchAllPaged({ kinds: [3], "#p": [t] }, working, { maxPages: 3 }),
     fetchAllPaged({ kinds: [9735], "#p": [t] }, working, { maxPages: 6 }), // Zap 受信
     fetchAllPaged({ kinds: [9735], "#P": [t] }, working, { maxPages: 6 }), // Zap 送信（大文字 P）
     queryRelays([{ kinds: [3], authors: [t], limit: 5 }], { relays: working }),
     findEarliest(t, working, seedMin),
+    verifyNip05(profile.nip05, t),
   ]);
 
   // フォロワー集合（kind:3 の発行者。自分は除外）
@@ -255,6 +256,7 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     handle: profile.name || "",
     picture: profile.picture || "",
     nip05: profile.nip05 || "",
+    nip05Verified,                      // true=検証OK / false=不一致 / null=確認不能
     about: profile.about || "",
     hasNip05: !!profile.nip05,
     // 実データ指標
@@ -270,6 +272,33 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     lastActivity: lastActivity || sinceAt || Math.floor(Date.now() / 1000),
     usedRelays: working,
   };
+}
+
+// ===== NIP-05 検証 =====
+// `<local>@<domain>`（@省略時は local="_"）について
+// https://<domain>/.well-known/nostr.json?name=<local> を引き、pubkey 一致を確認。
+// 返り値: true=検証OK / false=不一致 or 該当名なし / null=取得不能（CORS/ネットワーク等で確認不可）
+async function verifyNip05(nip05, pubkeyHex) {
+  if (!nip05 || !nip05.includes(".")) return null;
+  let name = "_", domain = nip05;
+  if (nip05.includes("@")) [name, domain] = nip05.split("@");
+  domain = (domain || "").trim();
+  if (!domain) return null;
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const url = `https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`;
+    const res = await fetch(url, { signal: ctrl.signal, redirect: "follow" });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const got = json && json.names && json.names[name];
+    if (!got) return false;
+    return String(got).toLowerCase() === pubkeyHex.toLowerCase();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(to);
+  }
 }
 
 // ===== ランク（実データ基準）=====
@@ -803,15 +832,24 @@ async function renderCard(d, theme = "jp") {
 
   // NIP-05（前グループとの間を広めに取って区切る）
   drawPill(c, "NIP-05", lx, 496, { bg: t.accent, fg: "#fff", font: "700 22px 'Hiragino Sans',sans-serif", h: 34 });
-  c.fillStyle = t.ink;
+  // 検証マーク分の余白を確保してアドレス本体を自動縮小
+  const markW = d.nip05 && d.nip05Verified !== null ? 36 : 0;
   let n5 = 32;
-  const nip05Text = d.nip05 ? d.nip05 + "  ✓" : "— not set —";
+  const nip05Addr = d.nip05 || "— not set —";
   while (n5 > 14) {
     c.font = `600 ${n5}px 'SF Mono','Menlo','Consolas',monospace`;
-    if (c.measureText(nip05Text).width <= fieldMaxW) break;
+    if (c.measureText(nip05Addr).width <= fieldMaxW - markW) break;
     n5 -= 1;
   }
-  c.fillText(nip05Text, lx, 552);
+  c.fillStyle = t.ink;
+  c.fillText(nip05Addr, lx, 552);
+  // 実際に検証した結果だけマークを出す（true=緑✓ / false=赤✗ / null=確認不能なので無印）
+  if (d.nip05 && d.nip05Verified !== null) {
+    const aw = c.measureText(nip05Addr).width;
+    c.font = "700 28px 'Hiragino Sans',sans-serif";
+    if (d.nip05Verified === true) { c.fillStyle = "#1c9e57"; c.fillText("✓", lx + aw + 12, 551); }
+    else { c.fillStyle = "#d23b3b"; c.fillText("✗", lx + aw + 12, 551); }
+  }
 
   // 下段3カラム（ISSUED / FIRST SEEN / LICENSE CLASS）
   // 日付は控えめに細く小さく。パネルとの間に余白を確保。
@@ -978,8 +1016,11 @@ async function issueFor(pubkeyHex) {
     lastData = data;
 
     await renderCard(data, $("theme-select").value);
+    const nip05State = !data.nip05 ? "" :
+      data.nip05Verified === true ? " / NIP-05 ✓検証OK" :
+      data.nip05Verified === false ? " / NIP-05 ✗不一致" : " / NIP-05 確認不能";
     setStatus(
-      `発行完了：${data.name}｜投稿 ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / リレー ${data.relayCount} / Zap受信 ⚡${data.zapRecv} 送信 ⚡${data.zapSent}`,
+      `発行完了：${data.name}｜投稿 ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / リレー ${data.relayCount} / Zap受信 ⚡${data.zapRecv} 送信 ⚡${data.zapSent}${nip05State}`,
       "ok"
     );
   } catch (err) {
