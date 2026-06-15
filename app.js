@@ -704,9 +704,9 @@ async function renderCard(d, theme = "jp") {
     g.fillStyle = fade;
     g.fillRect(0, 0, W, H);
     g.globalCompositeOperation = "source-over";
-    // まとめて薄く合成（透明度操作はここ1回だけ）
+    // まとめて薄く合成（透明度操作はここ1回だけ。濃さはこの値だけで全端末一括調整）
     c.save();
-    c.globalAlpha = 0.14;
+    c.globalAlpha = 0.20;
     c.drawImage(off, 0, 0);
     c.restore();
   }
