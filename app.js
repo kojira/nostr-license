@@ -650,49 +650,65 @@ async function renderCard(d, theme = "jp") {
   c.fillStyle = sheen;
   c.fillRect(0, 0, W, H);
 
-  // 全面の細密ギロシェ・メッシュ（2方向のサイン波が干渉して紙幣/ホログラム風に）
-  // 上部ほど濃く、下に向かって淡くフェード
-  c.save();
-  for (let i = 0; i < 78; i++) {
-    const yy = 26 + i * 12.4;
-    c.globalAlpha = Math.max(0.06, 0.6 * (1 - yy / (H * 1.18)));
-    c.strokeStyle = i % 2 ? t.line : t.accent;
-    c.lineWidth = 0.7;
-    c.beginPath();
-    for (let x = 24; x <= W - 24; x += 5) {
-      const y2 = yy
-        + Math.sin(x / 44 + i * 0.55) * 7
-        + Math.sin(x / 128 - i * 0.32) * 5
-        + Math.cos(x / 320 + i * 0.12) * 3;
-      x === 24 ? c.moveTo(x, y2) : c.lineTo(x, y2);
+  // 全面の細密ギロシェ（織り地＋ロゼット）。
+  // ※ 端末（描画エンジン: Skia/CoreGraphics 等）で「半透明線の重なり蓄積」の出方が違い、
+  //    濃さがブレる。これを防ぐため、別キャンバスに【不透明で一度だけ】描いてから、
+  //    最後に【1回だけ】薄く合成する（透明度操作を1回に集約 → 端末差が出にくい）。
+  {
+    const off = document.createElement("canvas");
+    off.width = W; off.height = H;
+    const g = off.getContext("2d");
+    g.lineCap = "round"; g.lineJoin = "round";
+    // 横波メッシュ（不透明・線幅1）
+    for (let i = 0; i < 78; i++) {
+      const yy = 26 + i * 12.4;
+      g.strokeStyle = i % 2 ? t.line : t.accent;
+      g.lineWidth = 1;
+      g.beginPath();
+      for (let x = 24; x <= W - 24; x += 5) {
+        const y2 = yy
+          + Math.sin(x / 44 + i * 0.55) * 7
+          + Math.sin(x / 128 - i * 0.32) * 5
+          + Math.cos(x / 320 + i * 0.12) * 3;
+        x === 24 ? g.moveTo(x, y2) : g.lineTo(x, y2);
+      }
+      g.stroke();
     }
-    c.stroke();
-  }
-  // 縦方向の波（横波と交差させて織り地＝ギロシェ風に）
-  for (let j = 0; j < 50; j++) {
-    const xx = 24 + j * 31;
-    c.globalAlpha = 0.09;
-    c.strokeStyle = j % 2 ? t.accent : t.line;
-    c.lineWidth = 0.6;
-    c.beginPath();
-    for (let y = 24; y <= H - 24; y += 6) {
-      const x2 = xx + Math.sin(y / 50 + j * 0.5) * 6 + Math.sin(y / 150 - j * 0.3) * 4;
-      y === 24 ? c.moveTo(x2, y) : c.lineTo(x2, y);
+    // 縦波メッシュ（交差させて織り地に）
+    for (let j = 0; j < 50; j++) {
+      const xx = 24 + j * 31;
+      g.strokeStyle = j % 2 ? t.accent : t.line;
+      g.lineWidth = 1;
+      g.beginPath();
+      for (let y = 24; y <= H - 24; y += 6) {
+        const x2 = xx + Math.sin(y / 50 + j * 0.5) * 6 + Math.sin(y / 150 - j * 0.3) * 4;
+        y === 24 ? g.moveTo(x2, y) : g.lineTo(x2, y);
+      }
+      g.stroke();
     }
-    c.stroke();
-  }
-  c.restore();
-
-  // ホログラムのロゼット紋様（重ねて立体感）
-  guilloche(c, W * 0.20, H * 0.34, 230, 74, 9, 26, t.accent, 0.08, 0.9);
-  guilloche(c, W * 0.20, H * 0.34, 150, 52, 14, 26, t.accent2, 0.07, 0.9);
-  guilloche(c, W * 0.50, H * 0.50, 380, 104, 7, 30, t.accent, 0.05, 0.9);
-  guilloche(c, W * 0.50, H * 0.50, 250, 84, 17, 26, t.accent2, 0.04, 0.9);
-  guilloche(c, W * 0.83, H * 0.72, 210, 66, 11, 24, t.accent2, 0.07, 0.9);
-  guilloche(c, W * 0.83, H * 0.72, 130, 46, 16, 24, t.accent, 0.06, 0.9);
-  // 四隅の小ロゼット
-  for (const [px, py] of [[110, 120], [W - 120, 120], [120, H - 110], [W - 120, H - 110]]) {
-    guilloche(c, px, py, 70, 26, 13, 18, t.accent, 0.06, 0.8);
+    // ロゼット紋様（不透明・線幅1）
+    guilloche(g, W * 0.20, H * 0.34, 230, 74, 9, 26, t.accent, 1, 1);
+    guilloche(g, W * 0.20, H * 0.34, 150, 52, 14, 26, t.accent2, 1, 1);
+    guilloche(g, W * 0.50, H * 0.50, 380, 104, 7, 30, t.accent, 1, 1);
+    guilloche(g, W * 0.50, H * 0.50, 250, 84, 17, 26, t.accent2, 1, 1);
+    guilloche(g, W * 0.83, H * 0.72, 210, 66, 11, 24, t.accent2, 1, 1);
+    guilloche(g, W * 0.83, H * 0.72, 130, 46, 16, 24, t.accent, 1, 1);
+    for (const [px, py] of [[110, 120], [W - 120, 120], [120, H - 110], [W - 120, H - 110]]) {
+      guilloche(g, px, py, 70, 26, 13, 18, t.accent, 1, 1);
+    }
+    // 上を濃く・下を淡く（決定論的なフェード。destination-out で一様に削る）
+    g.globalCompositeOperation = "destination-out";
+    const fade = g.createLinearGradient(0, 0, 0, H);
+    fade.addColorStop(0.0, "rgba(0,0,0,0)");
+    fade.addColorStop(1.0, "rgba(0,0,0,0.5)");
+    g.fillStyle = fade;
+    g.fillRect(0, 0, W, H);
+    g.globalCompositeOperation = "source-over";
+    // まとめて薄く合成（透明度操作はここ1回だけ）
+    c.save();
+    c.globalAlpha = 0.14;
+    c.drawImage(off, 0, 0);
+    c.restore();
   }
 
   // 斜めの虹色シーン（ホログラム反射のきらめき）
