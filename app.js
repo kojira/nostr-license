@@ -187,7 +187,7 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
   const selected = getActiveRelays();
 
   // --- Phase A: 選択リレーで軽量取得（profile / relay list）---
-  setStatus("リレーからプロフィールとリレーリストを取得中…");
+  setStatus("Fetching profile and relay list…");
   const [metaEvents, relayListEvents] = await Promise.all([
     queryRelays([{ kinds: [0], authors: [t], limit: 5 }], { relays: selected }),
     queryRelays([{ kinds: [10002], authors: [t], limit: 5 }], { relays: selected }),
@@ -208,7 +208,7 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
 
   // --- Phase B: working リレーで本取得（過去も遡って集計）---
   // まず投稿の先頭ページを取り、利用開始推定の起点(seedMin)にする
-  setStatus("活動・フォロワー・Zap を過去まで取得中…");
+  setStatus("Fetching activity, followers, and zaps through history…");
   const notes0 = await queryRelays([{ kinds: [1], authors: [t], limit: 500 }], { relays: working });
   const seedMin = notes0.length ? Math.min(...notes0.map((e) => e.created_at)) : (meta ? meta.created_at : null);
 
@@ -1018,11 +1018,11 @@ async function renderCard(d, theme = "jp") {
 async function issueFor(pubkeyHex) {
   try {
     if (getActiveRelays().length === 0) {
-      throw new Error("リレーを最低1つ指定してください");
+      throw new Error("Specify at least one relay");
     }
     const useUserRelays = $("use-user-relays").checked;
     const data = await fetchProfile(pubkeyHex, { useUserRelays });
-    setStatus("アバター / QR を生成中…");
+    setStatus("Generating avatar / QR…");
     const [avatar, qr] = await Promise.all([
       loadAvatar(data.picture),
       makeQR("https://njump.me/" + data.npub),
@@ -1033,15 +1033,15 @@ async function issueFor(pubkeyHex) {
 
     await renderCard(data, $("theme-select").value);
     const nip05State = !data.nip05 ? "" :
-      data.nip05Verified === true ? " / NIP-05 ✓検証OK" :
-      data.nip05Verified === false ? " / NIP-05 ✗不一致" : " / NIP-05 確認不能";
+      data.nip05Verified === true ? " / NIP-05 ✓verified" :
+      data.nip05Verified === false ? " / NIP-05 ✗mismatch" : " / NIP-05 unverifiable";
     setStatus(
-      `発行完了：${data.name}｜投稿 ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / リレー ${data.relayCount} / Zap受信 ⚡${data.zapRecv} 送信 ⚡${data.zapSent}${nip05State}`,
+      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / relays ${data.relayCount} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
       "ok"
     );
   } catch (err) {
     console.error(err);
-    setStatus("エラー: " + (err?.message || err), "error");
+    setStatus("Error: " + (err?.message || err), "error");
   }
 }
 
@@ -1050,34 +1050,34 @@ function toHexPubkey(raw) {
   raw = raw.trim();
   if (raw.startsWith("npub1")) return nip19.decode(raw).data;
   if (/^[0-9a-f]{64}$/i.test(raw)) return raw.toLowerCase();
-  throw new Error("npub1... または64桁hexを入力してください");
+  throw new Error("Enter an npub1... or 64-char hex");
 }
 
 // ===== イベント =====
 // NIP-07：公開鍵を取得して入力欄に入れるだけ（解析はしない）
 $("nip07-btn").addEventListener("click", async () => {
   if (!window.nostr) {
-    setStatus("NIP-07拡張機能が見つかりません（nos2x / Alby などをインストールしてください）", "error");
+    setStatus("No NIP-07 extension found (install nos2x / Alby, etc.)", "error");
     return;
   }
   try {
-    setStatus("NIP-07で公開鍵を取得中…");
+    setStatus("Getting public key via NIP-07…");
     const pk = await window.nostr.getPublicKey();
     $("npub-input").value = nip19.npubEncode(pk);
-    setStatus("npub を取得しました。「発行」を押してください。", "ok");
+    setStatus("Got your npub. Press Issue.", "ok");
   } catch (err) {
-    setStatus("エラー: " + (err?.message || err), "error");
+    setStatus("Error: " + (err?.message || err), "error");
   }
 });
 
 // 発行
 $("manual-btn").addEventListener("click", async () => {
   const raw = $("npub-input").value.trim();
-  if (!raw) { setStatus("npub を入力してください", "error"); return; }
+  if (!raw) { setStatus("Enter an npub", "error"); return; }
   try {
     await issueFor(toHexPubkey(raw));
   } catch (err) {
-    setStatus("エラー: " + (err?.message || err), "error");
+    setStatus("Error: " + (err?.message || err), "error");
   }
 });
 
@@ -1099,7 +1099,7 @@ function addRelayRow(value = "") {
   del.className = "btn relay-del";
   del.type = "button";
   del.textContent = "×";
-  del.title = "このリレーを削除";
+  del.title = "Remove this relay";
   del.addEventListener("click", () => {
     row.remove();
     if ($("relay-list").children.length === 0) addRelayRow(); // 最低1行は残す
@@ -1132,7 +1132,7 @@ DEFAULT_RELAYS.forEach((r) => addRelayRow(r));
   ctx.font = "700 30px 'Hiragino Sans','Noto Sans JP',sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText("Enter an npub and press 発行 to issue", canvas.width / 2, canvas.height / 2);
+  ctx.fillText("Enter an npub and press Issue", canvas.width / 2, canvas.height / 2);
 })();
 
 $("download-btn").addEventListener("click", () => {
@@ -1143,6 +1143,6 @@ $("download-btn").addEventListener("click", () => {
     a.download = "nostr-license.png";
     a.click();
   } catch (err) {
-    setStatus("ダウンロード失敗（アバター画像のCORS制限の可能性）: " + err.message, "error");
+    setStatus("Download failed (possible avatar CORS restriction): " + err.message, "error");
   }
 });

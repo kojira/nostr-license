@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Nostr License — Nostr免許証メーカー</title>
+  <title>Nostr License — driver's-license-style card maker</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0&icon_names=electric_car" />
@@ -12,40 +12,40 @@
 <body>
   <header class="site-header">
     <h1>🪪 Nostr License</h1>
-    <p class="tagline">NIP-07であなたのNostrアイデンティティを「免許証」にする</p>
+    <p class="tagline">Turn your Nostr identity into a driver's-license-style card.</p>
   </header>
 
   <main>
     <section class="controls">
       <div class="connect-row">
         <div class="manual">
-          <input id="npub-input" type="text" placeholder="npub1... を貼り付け" autocomplete="off" />
-          <button id="manual-btn" class="btn btn-primary">発行</button>
+          <input id="npub-input" type="text" placeholder="Paste npub1..." autocomplete="off" />
+          <button id="manual-btn" class="btn btn-primary">Issue</button>
         </div>
-        <button id="nip07-btn" class="btn">NIP-07からnpubを取得</button>
+        <button id="nip07-btn" class="btn">Get npub from NIP-07</button>
       </div>
 
       <div class="options">
-        <label>デザイン
+        <label>Design
           <select id="theme-select">
-            <option value="jp">日本の免許証風（ブルー）</option>
-            <option value="cyber">サイバーパンク</option>
-            <option value="gold">ゴールド免許</option>
+            <option value="jp">Driver's license (blue)</option>
+            <option value="cyber">Cyberpunk</option>
+            <option value="gold">Gold license</option>
           </select>
         </label>
       </div>
 
       <div class="relays">
         <div class="relays-head">
-          <span class="relays-title">データ取得リレー</span>
-          <button id="add-relay-btn" type="button" class="btn btn-sm">＋リレー追加</button>
+          <span class="relays-title">Data relays</span>
+          <button id="add-relay-btn" type="button" class="btn btn-sm">+ Add relay</button>
         </div>
         <div id="relay-list"></div>
         <label class="checkbox">
           <input type="checkbox" id="use-user-relays" />
-          対象の公開リレーリスト(kind:10002)も取得先に加える
+          Also query the target's published relay list (kind:10002)
         </label>
-        <p class="relays-note">フォロワー/WoT は取得先リレーの保持範囲に依存します。網羅性を上げたい場合は大手リレーを追加してください。</p>
+        <p class="relays-note">Followers / WoT depend on what the selected relays retain. Add major relays for broader coverage.</p>
       </div>
 
       <p id="status" class="status"></p>
@@ -54,21 +54,22 @@
     <section class="preview">
       <canvas id="license-canvas" width="1568" height="984"></canvas>
       <div class="actions">
-        <button id="download-btn" class="btn btn-primary" disabled>PNGをダウンロード</button>
+        <button id="download-btn" class="btn btn-primary" disabled>Download PNG</button>
       </div>
     </section>
 
     <details class="info">
-      <summary>このサービスについて / 注意</summary>
+      <summary>About / notes</summary>
       <ul>
-        <li>NIP-07対応の拡張機能（nos2x, Alby など）が必要です。接続時に署名チャレンジを求め、<strong>その npub の秘密鍵所有者であること</strong>を確認します。</li>
-        <li>使用リレー: <code>wss://r.kojira.io</code> / <code>wss://x.kojira.io</code> / <code>wss://yabu.me</code></li>
-        <li>これは遊びのファンカードであり、公的な身分証明書ではありません。</li>
-        <li>アイコン画像のホストがCORSを許可していない場合、ダウンロード画像ではアバターがプレースホルダになることがあります。</li>
+        <li><strong>Issue</strong>: paste an <code>npub1...</code> (or 64-char hex) and press Issue to generate that profile's card. Processing is identical whether the key comes from NIP-07 or manual entry — no private key required.</li>
+        <li><strong>Get npub from NIP-07</strong>: pulls your public key from a NIP-07 extension (nos2x, Alby, …) into the input box. It does not sign anything.</li>
+        <li>NIP-05 is actually verified against <code>/.well-known/nostr.json</code> (green ✓ = verified, red ✗ = mismatch, no mark = could not check).</li>
+        <li>This is a fan card for fun, not an official ID.</li>
+        <li>If an avatar host doesn't allow CORS, the avatar may fall back to a placeholder in the downloaded image.</li>
       </ul>
     </details>
   </main>
 
-  <script type="module" src="app.js?v=15"></script>
+  <script type="module" src="app.js?v=16"></script>
 </body>
 </html>
