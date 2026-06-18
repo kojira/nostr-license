@@ -1077,20 +1077,16 @@ async function renderCard(d, theme = "jp") {
     drawStarRating(c, cxp + 300, cyp, s.n, 26, "#1e2a5a", "#b9c1d7");
   }
 
-  // パネル内フッター：MILEAGE / PEAK（区切り線つき）
+  // パネル内フッター：PEAK のみ（Nostr は投稿数を正確に数えられないため MILEAGE は出さない）
   c.strokeStyle = t.gold2; c.globalAlpha = 0.4; c.lineWidth = 1;
   c.beginPath(); c.moveTo(pnX + 40, pnY + 152); c.lineTo(pnX + pnW - 40, pnY + 152); c.stroke();
   c.globalAlpha = 1;
   const fy = pnY + 176;
   c.textAlign = "left"; c.textBaseline = "alphabetic";
   c.fillStyle = panelSub; c.font = "700 18px 'Hiragino Sans',sans-serif";
-  c.fillText("MILEAGE", colX[0], fy);
+  c.fillText("PEAK (UTC)", colX[0], fy);
   c.fillStyle = panelInk; c.font = "700 22px 'Hiragino Sans',sans-serif";
-  c.fillText(String(d.activity) + (d.activityCapped ? "+" : ""), colX[0] + 104, fy);
-  c.fillStyle = panelSub; c.font = "700 18px 'Hiragino Sans',sans-serif";
-  c.fillText("PEAK (UTC)", colX[1], fy);
-  c.fillStyle = panelInk; c.font = "700 22px 'Hiragino Sans',sans-serif";
-  c.fillText(d.peakUTC || "—", colX[1] + 144, fy);
+  c.fillText(d.peakUTC || "—", colX[0] + 144, fy);
 
   // ===== 署名・AUTHORIZED・ホロ印（パネル右）=====
   c.fillStyle = t.ink;
