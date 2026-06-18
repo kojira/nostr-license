@@ -1182,8 +1182,8 @@ function shareStatus(msg, kind = "") {
 
 function defaultCaption() {
   return isJa()
-    ? "Nostr License を作ってみた！ #NostrLicense"
-    : "I made my Nostr License! #NostrLicense";
+    ? "Nostr License を作ってみた！ #NostrLicense\nhttps://kojira.github.io/nostr-license/"
+    : "I made my Nostr License! #NostrLicense\nhttps://kojira.github.io/nostr-license/";
 }
 
 function buildHostOptions() {
