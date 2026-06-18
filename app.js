@@ -982,8 +982,15 @@ async function renderCard(d, theme = "jp") {
   c.fillStyle = "#1b2336";
   c.textAlign = "center";
   c.textBaseline = "alphabetic";
-  c.font = "italic 600 46px 'Snell Roundhand','Apple Chancery','Brush Script MT',cursive";
-  c.fillText(d.handle || d.name, 1285, 828);
+  const sigText = d.handle || d.name || "";
+  const sigMaxW = 290; // ホロ印（左端~1438）に被らない範囲
+  let sigSize = 46;
+  while (sigSize > 18) {
+    c.font = `italic 600 ${sigSize}px 'Snell Roundhand','Apple Chancery','Brush Script MT',cursive`;
+    if (c.measureText(sigText).width <= sigMaxW) break;
+    sigSize -= 2;
+  }
+  c.fillText(sigText, 1285, 828);
   c.fillStyle = t.sub;
   c.font = "700 20px 'Hiragino Sans',sans-serif";
   c.fillText("AUTHORIZED BY NOSTR", 1285, 866);
