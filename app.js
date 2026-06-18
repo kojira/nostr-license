@@ -270,10 +270,14 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     wotValue,
     sinceAt,                            // 利用開始（最古イベント推定、取れなければ null）
     lastActivity: lastActivity || sinceAt || Math.floor(Date.now() / 1000),
-    velocity: (() => {                  // 1日あたり投稿数（Bluesky版と同じ算出）
-      const ref = sinceAt || (noteEvents.length ? Math.min(...noteEvents.map((e) => e.created_at)) : null);
-      const ageDays = ref ? Math.max((Date.now() / 1000 - ref) / 86400, 1) : 1;
-      return noteEvents.length / ageDays;
+    velocity: (() => {                  // 1日あたり投稿数
+      // Nostr は全投稿を取り切れない（リレー保持範囲＋ページング上限）ため、
+      // 「全期間で割る」と多投稿者ほど過小評価される。代わりに【収集できた直近
+      // ノートが実際にカバーした期間】で割り、最近の投稿ペースを推定する。
+      if (!noteEvents.length) return 0;
+      const ts = noteEvents.map((e) => e.created_at);
+      const spanDays = (Math.max(...ts) - Math.min(...ts)) / 86400;
+      return noteEvents.length / Math.max(spanDays, 0.5);
     })(),
     peakUTC: peakBand(noteEvents.map((e) => e.created_at)),  // 最も活発な時間帯
     usedRelays: working,
@@ -336,7 +340,7 @@ function computeStars(d) {
   return [
     { label: "Communication", icon: "bubble", n: starFrom(d.activity, 1.6), note: d.activity + (d.activityCapped ? "+" : "") },
     { label: "Web of Trust", icon: "shield", n: starFrom(d.wotValue, 1.6), note: String(d.wotValue) },
-    { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 2.4), note: String(d.relayCount) },
+    { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 2.9), note: String(d.relayCount) },
     { label: "Velocity", icon: "relay", n: starFrom(d.velocity, 2.5), note: (d.velocity || 0).toFixed(1) + "/d" },
     { label: "Zap Received", icon: "bolt", n: starFrom(d.zapRecv, 1.6), note: String(d.zapRecv) },
     { label: "Zap Sent", icon: "bolt", n: starFrom(d.zapSent, 1.6), note: String(d.zapSent) },
