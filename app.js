@@ -270,6 +270,12 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     wotValue,
     sinceAt,                            // 利用開始（最古イベント推定、取れなければ null）
     lastActivity: lastActivity || sinceAt || Math.floor(Date.now() / 1000),
+    velocity: (() => {                  // 1日あたり投稿数（Bluesky版と同じ算出）
+      const ref = sinceAt || (noteEvents.length ? Math.min(...noteEvents.map((e) => e.created_at)) : null);
+      const ageDays = ref ? Math.max((Date.now() / 1000 - ref) / 86400, 1) : 1;
+      return noteEvents.length / ageDays;
+    })(),
+    peakUTC: peakBand(noteEvents.map((e) => e.created_at)),  // 最も活発な時間帯
     usedRelays: working,
   };
 }
@@ -315,12 +321,23 @@ function starFrom(x, k, base = 1) {
   const n = Math.round(Math.log10((x || 0) + 1) * k) + base;
   return Math.max(1, Math.min(5, n));
 }
-// ステータス（5項目・すべて実データ）。2列グリッドで表示。各 {label, n, note, icon}
+// 最も活発な2時間帯（UTC）。"HH–HH UTC"。
+function peakBand(timestamps) {
+  if (!timestamps.length) return "—";
+  const h = new Array(24).fill(0);
+  for (const t of timestamps) h[new Date(t * 1000).getUTCHours()]++;
+  let bi = 0, bv = -1;
+  for (let i = 0; i < 24; i++) { const v = h[i] + h[(i + 1) % 24]; if (v > bv) { bv = v; bi = i; } }
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(bi)}–${p((bi + 2) % 24)} UTC`;
+}
+// ステータス（6項目・すべて実データ）。2列×3行で表示。各 {label, n, note, icon}
 function computeStars(d) {
   return [
     { label: "Communication", icon: "bubble", n: starFrom(d.activity, 1.6), note: d.activity + (d.activityCapped ? "+" : "") },
     { label: "Web of Trust", icon: "shield", n: starFrom(d.wotValue, 1.6), note: String(d.wotValue) },
     { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 2.4), note: String(d.relayCount) },
+    { label: "Velocity", icon: "relay", n: starFrom(d.velocity, 2.5), note: (d.velocity || 0).toFixed(1) + "/d" },
     { label: "Zap Received", icon: "bolt", n: starFrom(d.zapRecv, 1.6), note: String(d.zapRecv) },
     { label: "Zap Sent", icon: "bolt", n: starFrom(d.zapSent, 1.6), note: String(d.zapSent) },
   ];
@@ -929,7 +946,7 @@ async function renderCard(d, theme = "jp") {
   }
 
   // ===== ステータス・パネル（DRIVER PROFILE）=====
-  const pnX = 60, pnY = 712, pnW = 1000, pnH = 182;
+  const pnX = 60, pnY = 712, pnW = 1000, pnH = 192;
   c.save();
   c.shadowColor = "rgba(80,60,20,0.18)";
   c.shadowBlur = 16;
@@ -971,22 +988,37 @@ async function renderCard(d, theme = "jp") {
   c.fillText("NOSTR DRIVER PROFILE", tbX + 24, tbY + tbH / 2 + 1);
   c.restore();
 
-  // ステータス 2列×3行
+  // ステータス 2列×3行（6項目）
   const stats = computeStars(d);
   const colX = [pnX + 40, pnX + 510];
-  const rowsY = [pnY + 56, pnY + 106, pnY + 156];
+  const rowsY = [pnY + 48, pnY + 88, pnY + 128];
   for (let i = 0; i < stats.length; i++) {
     const s = stats[i];
     const cxp = colX[i % 2];
     const cyp = rowsY[Math.floor(i / 2)];
-    drawStatIcon(c, s.icon, cxp, cyp - 15, 28, t.accent);
+    drawStatIcon(c, s.icon, cxp, cyp - 15, 26, t.accent);
     c.fillStyle = t.ink;
     c.textAlign = "left";
     c.textBaseline = "middle";
-    c.font = "700 27px 'Hiragino Sans',sans-serif";
-    c.fillText(s.label, cxp + 44, cyp);
-    drawStarRating(c, cxp + 296, cyp, s.n, 28, "#1e2a5a", "#b9c1d7");
+    c.font = "700 25px 'Hiragino Sans',sans-serif";
+    c.fillText(s.label, cxp + 42, cyp);
+    drawStarRating(c, cxp + 300, cyp, s.n, 26, "#1e2a5a", "#b9c1d7");
   }
+
+  // パネル内フッター：MILEAGE / PEAK（区切り線つき）
+  c.strokeStyle = t.gold2; c.globalAlpha = 0.4; c.lineWidth = 1;
+  c.beginPath(); c.moveTo(pnX + 40, pnY + 152); c.lineTo(pnX + pnW - 40, pnY + 152); c.stroke();
+  c.globalAlpha = 1;
+  const fy = pnY + 176;
+  c.textAlign = "left"; c.textBaseline = "alphabetic";
+  c.fillStyle = t.sub; c.font = "700 18px 'Hiragino Sans',sans-serif";
+  c.fillText("MILEAGE", colX[0], fy);
+  c.fillStyle = t.ink; c.font = "700 22px 'Hiragino Sans',sans-serif";
+  c.fillText(String(d.activity) + (d.activityCapped ? "+" : ""), colX[0] + 104, fy);
+  c.fillStyle = t.sub; c.font = "700 18px 'Hiragino Sans',sans-serif";
+  c.fillText("PEAK (UTC)", colX[1], fy);
+  c.fillStyle = t.ink; c.font = "700 22px 'Hiragino Sans',sans-serif";
+  c.fillText(d.peakUTC || "—", colX[1] + 144, fy);
 
   // ===== 署名・AUTHORIZED・ホロ印（パネル右）=====
   c.fillStyle = "#1b2336";
@@ -1055,7 +1087,7 @@ async function issueFor(pubkeyHex) {
       data.nip05Verified === true ? " / NIP-05 ✓verified" :
       data.nip05Verified === false ? " / NIP-05 ✗mismatch" : " / NIP-05 unverifiable";
     setStatus(
-      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / relays ${data.relayCount} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
+      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / relays ${data.relayCount} / vel ${(data.velocity || 0).toFixed(1)}/d / peak ${data.peakUTC} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
       "ok"
     );
   } catch (err) {
