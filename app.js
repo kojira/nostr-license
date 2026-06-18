@@ -340,7 +340,7 @@ function computeStars(d) {
   return [
     { label: "Communication", icon: "bubble", n: starFrom(d.activity, 1.6), note: d.activity + (d.activityCapped ? "+" : "") },
     { label: "Web of Trust", icon: "shield", n: starFrom(d.wotValue, 1.6), note: String(d.wotValue) },
-    { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 2.9), note: String(d.relayCount) },
+    { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 3.7, 0), note: String(d.relayCount) },
     { label: "Velocity", icon: "relay", n: starFrom(d.velocity, 2.5), note: (d.velocity || 0).toFixed(1) + "/d" },
     { label: "Zap Received", icon: "bolt", n: starFrom(d.zapRecv, 1.6), note: String(d.zapRecv) },
     { label: "Zap Sent", icon: "bolt", n: starFrom(d.zapSent, 1.6), note: String(d.zapSent) },
