@@ -827,11 +827,21 @@ async function renderCard(d, theme = "jp") {
   drawPill(c, "NAME", lx, 208, { bg: t.accent, fg: "#fff", font: "700 22px 'Hiragino Sans',sans-serif", h: 34 });
   c.fillStyle = t.ink;
   c.textAlign = "left";
-  c.font = "800 58px 'Hiragino Sans','Yu Gothic',sans-serif";
+  let nameSz = 58; // 長い表示名は枠内に収まるまで縮小
+  while (nameSz > 20) {
+    c.font = `800 ${nameSz}px 'Hiragino Sans','Yu Gothic',sans-serif`;
+    if (c.measureText(d.name).width <= fieldMaxW) break;
+    nameSz -= 2;
+  }
   c.fillText(d.name, lx, 292);          // NAME ピルとの間を詰める
   if (d.handle) {
     c.fillStyle = t.accent;
-    c.font = "600 28px 'Hiragino Sans',sans-serif";
+    let hSz = 28; // 長いハンドルも縮小
+    while (hSz > 14) {
+      c.font = `600 ${hSz}px 'Hiragino Sans',sans-serif`;
+      if (c.measureText(d.handle).width <= fieldMaxW) break;
+      hSz -= 1;
+    }
     c.fillText(d.handle, lx, 348);      // 名前との間を広げる
   }
 
