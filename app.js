@@ -1029,6 +1029,8 @@ async function renderCard(d, theme = "jp") {
   c.fillText("BUCKLE UP, STAY DECENTRALIZED.", W - PAD, capY);
 
   $("download-btn").disabled = false;
+  const pb = $("post-btn");
+  if (pb) pb.disabled = false;
 }
 
 // ===== 発行フロー（取得元が NIP-07 でも手入力でも完全に同じ処理）=====
@@ -1163,3 +1165,150 @@ $("download-btn").addEventListener("click", () => {
     setStatus("Download failed (possible avatar CORS restriction): " + err.message, "error");
   }
 });
+
+// ===== NIP-07 でログイン中なら Nostr へ投稿（NIP-96 アップロード + kind:1）=====
+// NIP-96 アップロードAPI（well-known で確認済み）
+const UPLOAD_HOSTS = {
+  "nostr.build": "https://nostr.build/api/v2/nip96/upload",
+  "nostrcheck.me": "https://cdn.nostrcheck.me",
+  "share.yabu.me": "https://yabu.me/api/v2/media",
+};
+const isJa = () => (navigator.language || "").toLowerCase().startsWith("ja");
+
+function shareStatus(msg, kind = "") {
+  const el = $("share-status");
+  if (el) { el.textContent = msg; el.className = "status" + (kind ? " " + kind : ""); }
+}
+
+function defaultCaption() {
+  return isJa()
+    ? "Nostr License を作ってみた！ #NostrLicense #Nostr\nあなたも作れる → https://kojira.github.io/nostr-license/"
+    : "I made my Nostr License! #NostrLicense #Nostr\nMake yours → https://kojira.github.io/nostr-license/";
+}
+
+function buildHostOptions() {
+  const sel = $("upload-host");
+  if (!sel) return;
+  const order = isJa()
+    ? ["share.yabu.me", "nostr.build", "nostrcheck.me"]
+    : ["nostr.build", "nostrcheck.me"];
+  sel.innerHTML = order.map((h) => `<option value="${h}">${h}</option>`).join("");
+}
+
+function canvasToBlob() {
+  return new Promise((resolve, reject) =>
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Could not export image (avatar CORS?)"))), "image/png")
+  );
+}
+
+// NIP-98: HTTP リクエスト認可イベント（kind:27235）を NIP-07 で署名
+async function nip98Header(url, method) {
+  const evt = {
+    kind: 27235,
+    created_at: Math.floor(Date.now() / 1000),
+    tags: [["u", url], ["method", method]],
+    content: "",
+  };
+  const signed = await window.nostr.signEvent(evt);
+  return "Nostr " + btoa(JSON.stringify(signed));
+}
+
+// NIP-96 アップロード → 公開URLと NIP-94 タグを返す
+async function uploadImage(apiUrl, blob) {
+  const auth = await nip98Header(apiUrl, "POST");
+  const fd = new FormData();
+  fd.append("file", blob, "nostr-license.png");
+  fd.append("content_type", "image/png");
+  const res = await fetch(apiUrl, { method: "POST", headers: { Authorization: auth }, body: fd });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`upload failed (HTTP ${res.status}) ${text.slice(0, 160)}`);
+  let j; try { j = JSON.parse(text); } catch { throw new Error("upload: invalid JSON response"); }
+  const tags = (j && j.nip94_event && j.nip94_event.tags) || [];
+  let url = (tags.find((t) => t[0] === "url") || [])[1] || j.url || (j.data && j.data.url);
+  if (!url) throw new Error("upload: no URL in response");
+  return { url, nip94: tags };
+}
+
+function extractHashtags(text) {
+  const out = [], seen = new Set();
+  const re = /(?:^|\s)#([\p{L}\p{N}_]+)/gu;
+  let m;
+  while ((m = re.exec(text))) {
+    const t = m[1].toLowerCase();
+    if (!seen.has(t)) { seen.add(t); out.push(t); }
+  }
+  return out;
+}
+
+function imetaTag(url, nip94) {
+  const want = ["m", "x", "ox", "dim", "blurhash"];
+  const parts = ["url " + url];
+  for (const t of nip94 || []) if (want.includes(t[0]) && t[1]) parts.push(`${t[0]} ${t[1]}`);
+  return ["imeta", ...parts];
+}
+
+// kind:1 を NIP-07 で署名して選択中リレーへ publish
+async function publishNote(content, imageUrl, nip94) {
+  const pk = await window.nostr.getPublicKey();
+  const tags = extractHashtags(content).map((t) => ["t", t]);
+  tags.push(imetaTag(imageUrl, nip94));
+  const evt = { kind: 1, created_at: Math.floor(Date.now() / 1000), tags, content, pubkey: pk };
+  const signed = await window.nostr.signEvent(evt);
+  const relays = getActiveRelays();
+  const results = await Promise.all(relays.map((url) => new Promise((resolve) => {
+    let done = false, ws;
+    const finish = (ok, msg) => { if (done) return; done = true; try { ws.close(); } catch {} resolve({ url, ok, msg }); };
+    try { ws = new WebSocket(url); } catch { resolve({ url, ok: false, msg: "ws error" }); return; }
+    const timer = setTimeout(() => finish(false, "timeout"), 6000);
+    ws.onopen = () => { try { ws.send(JSON.stringify(["EVENT", signed])); } catch (e) { clearTimeout(timer); finish(false, String(e)); } };
+    ws.onmessage = (m) => {
+      try { const d = JSON.parse(m.data); if (d[0] === "OK" && d[1] === signed.id) { clearTimeout(timer); finish(!!d[2], d[3] || ""); } } catch {}
+    };
+    ws.onerror = () => { clearTimeout(timer); finish(false, "ws error"); };
+  })));
+  return { signed, results };
+}
+
+async function postToNostr() {
+  if (!window.nostr) { shareStatus("No NIP-07 extension found", "error"); return; }
+  if (!lastData) { shareStatus("Generate a card first (press Issue)", "error"); return; }
+  if (getActiveRelays().length === 0) { shareStatus("Add at least one relay to publish to", "error"); return; }
+  const hostName = $("upload-host").value;
+  const apiUrl = UPLOAD_HOSTS[hostName];
+  const caption = $("post-caption").value.trim();
+  const btn = $("post-btn");
+  try {
+    btn.disabled = true;
+    shareStatus("Exporting image…");
+    const blob = await canvasToBlob();
+    shareStatus(`Uploading to ${hostName}… (approve the NIP-98 signature)`);
+    const { url, nip94 } = await uploadImage(apiUrl, blob);
+    shareStatus("Signing & publishing the note… (approve the signature)");
+    const content = caption ? `${caption}\n${url}` : url;
+    const { results } = await publishNote(content, url, nip94);
+    const ok = results.filter((r) => r.ok).length;
+    shareStatus(`Posted to ${ok}/${results.length} relays. Image: ${url}`, ok ? "ok" : "error");
+  } catch (err) {
+    console.error(err);
+    shareStatus("Error: " + (err?.message || err), "error");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function initShare() {
+  if (!window.nostr) return false;
+  const box = $("share-box");
+  if (!box || !box.hidden) return true; // already shown
+  buildHostOptions();
+  $("post-caption").value = defaultCaption();
+  $("post-btn").addEventListener("click", postToNostr);
+  box.hidden = false;
+  return true;
+}
+
+// 拡張機能が遅れて inject される場合に備えて数回試す
+if (!initShare()) {
+  let tries = 0;
+  const iv = setInterval(() => { if (initShare() || ++tries > 6) clearInterval(iv); }, 500);
+}

@@ -154,6 +154,47 @@ main {
   background: #0a0d12;
 }
 
+.share-box {
+  width: 100%;
+  max-width: 660px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 16px 18px;
+  margin-top: 4px;
+}
+.share-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.share-title { font-weight: 700; color: var(--text); }
+.share-host { color: var(--muted); font-size: 14px; display: inline-flex; gap: 8px; align-items: center; }
+.share-host select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 9px;
+  padding: 8px 10px;
+}
+.post-caption {
+  width: 100%;
+  resize: vertical;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 9px;
+  padding: 10px 12px;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.share-actions { margin-top: 10px; }
+.share-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 10px 0 0; }
+
 .info {
   margin: 28px auto 60px;
   max-width: 660px;

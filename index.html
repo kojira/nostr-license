@@ -56,6 +56,21 @@
       <div class="actions">
         <button id="download-btn" class="btn btn-primary" disabled>Download PNG</button>
       </div>
+
+      <div id="share-box" class="share-box" hidden>
+        <div class="share-head">
+          <span class="share-title">⚡ Share to Nostr</span>
+          <label class="share-host">Upload to
+            <select id="upload-host"></select>
+          </label>
+        </div>
+        <textarea id="post-caption" class="post-caption" rows="3" placeholder="Write a caption (hashtags like #NostrLicense become t-tags)…"></textarea>
+        <div class="share-actions">
+          <button id="post-btn" class="btn btn-primary" disabled>Post to Nostr</button>
+        </div>
+        <p id="share-status" class="status"></p>
+        <p class="share-note">Signed locally with your NIP-07 extension. The image is uploaded (NIP-96) to the host you pick, then a kind:1 note is published to the relays above. You approve every signature in your extension.</p>
+      </div>
     </section>
 
     <details class="info">
@@ -64,12 +79,13 @@
         <li><strong>Issue</strong>: paste an <code>npub1...</code> (or 64-char hex) and press Issue to generate that profile's card. Processing is identical whether the key comes from NIP-07 or manual entry — no private key required.</li>
         <li><strong>Get npub from NIP-07</strong>: pulls your public key from a NIP-07 extension (nos2x, Alby, …) into the input box. It does not sign anything.</li>
         <li>NIP-05 is actually verified against <code>/.well-known/nostr.json</code> (green ✓ = verified, red ✗ = mismatch, no mark = could not check).</li>
+        <li><strong>Share to Nostr</strong> (appears when a NIP-07 extension is detected): uploads the card image (NIP-96) to a host you choose, then publishes a hashtagged <code>kind:1</code> note to the relays above. Every signature is approved in your extension; no private key leaves it.</li>
         <li>This is a fan card for fun, not an official ID.</li>
         <li>If an avatar host doesn't allow CORS, the avatar may fall back to a placeholder in the downloaded image.</li>
       </ul>
     </details>
   </main>
 
-  <script type="module" src="app.js?v=18"></script>
+  <script type="module" src="app.js?v=19"></script>
 </body>
 </html>
