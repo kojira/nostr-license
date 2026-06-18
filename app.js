@@ -624,9 +624,69 @@ const THEMES = {
   jp:    { accent: "#2b4fce", accent2: "#7b3ff2", ink: "#16233a", sub: "#43507a", line: "#9fb1e6", border: "#3a5bd0", gold1: "#dcc07f", gold2: "#b48a3c", paper: ["#f3f6fd", "#eef0fb", "#fbf2f5"] },
   cyber: { accent: "#0a9fc0", accent2: "#d6249f", ink: "#142539", sub: "#3a5066", line: "#9bd3e2", border: "#0a9fc0", gold1: "#bcae72", gold2: "#8c7a38", paper: ["#eafaff", "#eef0fb", "#fde8f6"] },
   gold:  { accent: "#b4863a", accent2: "#9a6b1e", ink: "#2a2206", sub: "#5a4d22", line: "#dcc79a", border: "#b4863a", gold1: "#e6cd84", gold2: "#b4863a", paper: ["#fffaf0", "#fff4e2", "#fdeed6"] },
+  purple: { accent: "#7b3ff2", accent2: "#b14ddb", ink: "#221636", sub: "#574a78", line: "#cdbcf3", border: "#7b3ff2", gold1: "#dcc07f", gold2: "#b48a3c", paper: ["#f7f3fe", "#f1ecfb", "#faf0fb"], motif: "ostrich" },
+  pink:  { accent: "#e0249f", accent2: "#ff5fa2", ink: "#3a1030", sub: "#7a3a60", line: "#f3c0dd", border: "#e0249f", gold1: "#dcc07f", gold2: "#b48a3c", paper: ["#fdeef7", "#fbeef5", "#fde8f0"] },
+  sunset: { accent: "#e8722a", accent2: "#d6402f", ink: "#3a1d0a", sub: "#7a4a2a", line: "#f3cda0", border: "#e8722a", gold1: "#e6cd84", gold2: "#b4863a", paper: ["#fff4e6", "#ffeede", "#fde6d8"] },
+  green: { accent: "#1f9e55", accent2: "#3fb37a", ink: "#0e2a1a", sub: "#3a5a48", line: "#bfe0c8", border: "#1f9e55", gold1: "#dcc07f", gold2: "#b48a3c", paper: ["#eefaf0", "#eef7f0", "#e8f5ec"] },
+  galaxy: { accent: "#9b7bff", accent2: "#ff6ad5", ink: "#eef0ff", sub: "#aab0e0", line: "#3a3a72", border: "#6b4bd6", gold1: "#e6cd84", gold2: "#b4863a", paper: ["#0b0a1e", "#141033", "#211046"], motif: "galaxy", dark: true },
 };
 
 // ===== カード描画（高級ホログラム調 / 英語表記）=====
+// "#rrggbb" + alpha → "rgba(...)"
+function hexA(hex, a) {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+}
+
+// 透かしのダチョウ・シルエット（Nostr マスコット）。faint watermark.
+function drawOstrich(c, cx, cy, s, color, alpha) {
+  c.save();
+  c.globalAlpha = alpha;
+  c.fillStyle = color; c.strokeStyle = color;
+  c.lineCap = "round"; c.lineJoin = "round";
+  // 脚
+  c.lineWidth = 7 * s;
+  c.beginPath(); c.moveTo(cx - 6 * s, cy + 40 * s); c.lineTo(cx - 14 * s, cy + 120 * s); c.stroke();
+  c.beginPath(); c.moveTo(cx + 16 * s, cy + 40 * s); c.lineTo(cx + 12 * s, cy + 122 * s); c.stroke();
+  c.lineWidth = 5 * s;
+  c.beginPath(); c.moveTo(cx - 14 * s, cy + 120 * s); c.lineTo(cx - 28 * s, cy + 128 * s); c.stroke();
+  c.beginPath(); c.moveTo(cx + 12 * s, cy + 122 * s); c.lineTo(cx + 26 * s, cy + 130 * s); c.stroke();
+  // 胴体
+  c.beginPath(); c.ellipse(cx, cy, 72 * s, 54 * s, 0, 0, Math.PI * 2); c.fill();
+  // 尾羽（右後ろ）
+  c.beginPath(); c.ellipse(cx + 64 * s, cy - 16 * s, 28 * s, 21 * s, -0.5, 0, Math.PI * 2); c.fill();
+  // 首（太い曲線・左上へ）
+  c.lineWidth = 20 * s;
+  c.beginPath(); c.moveTo(cx - 34 * s, cy - 22 * s);
+  c.quadraticCurveTo(cx - 74 * s, cy - 58 * s, cx - 80 * s, cy - 120 * s); c.stroke();
+  // 頭
+  c.beginPath(); c.ellipse(cx - 86 * s, cy - 128 * s, 17 * s, 14 * s, -0.2, 0, Math.PI * 2); c.fill();
+  // くちばし
+  c.beginPath(); c.moveTo(cx - 100 * s, cy - 130 * s); c.lineTo(cx - 120 * s, cy - 126 * s); c.lineTo(cx - 101 * s, cy - 120 * s); c.closePath(); c.fill();
+  c.restore();
+}
+
+// 銀河・宇宙背景（決定論的な星＋ネビュラ）
+function drawGalaxy(c, W, H, t) {
+  for (const [x, y, r, col] of [
+    [W * 0.28, H * 0.34, 380, t.accent2],
+    [W * 0.72, H * 0.52, 440, t.accent],
+    [W * 0.5, H * 0.82, 320, "#3b6bd0"],
+  ]) {
+    const g = c.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, hexA(col, 0.32));
+    g.addColorStop(1, hexA(col, 0));
+    c.fillStyle = g; c.fillRect(0, 0, W, H);
+  }
+  let s = 2246; // 固定シードで端末非依存
+  const rnd = () => ((s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  for (let i = 0; i < 460; i++) {
+    const x = rnd() * W, y = rnd() * H, r = rnd() * 1.6 + 0.3, a = rnd() * 0.7 + 0.2;
+    c.fillStyle = `rgba(255,255,255,${a.toFixed(2)})`;
+    c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+  }
+}
+
 async function renderCard(d, theme = "jp") {
   const t = THEMES[theme] || THEMES.jp;
   const c = ctx;
@@ -671,7 +731,9 @@ async function renderCard(d, theme = "jp") {
   // ※ 端末（描画エンジン: Skia/CoreGraphics 等）で「半透明線の重なり蓄積」の出方が違い、
   //    濃さがブレる。これを防ぐため、別キャンバスに【不透明で一度だけ】描いてから、
   //    最後に【1回だけ】薄く合成する（透明度操作を1回に集約 → 端末差が出にくい）。
-  {
+  if (t.motif === "galaxy") {
+    drawGalaxy(c, W, H, t);
+  } else {
     const off = document.createElement("canvas");
     off.width = W; off.height = H;
     const g = off.getContext("2d");
@@ -728,6 +790,11 @@ async function renderCard(d, theme = "jp") {
     c.restore();
   }
 
+  // ダチョウ透かし（紫テーマ等の motif）。写真枠・パネルを避けた中央左に配置。
+  if (t.motif === "ostrich") {
+    drawOstrich(c, W * 0.33, H * 0.50, 1.95, t.accent, 0.12);
+  }
+
   // 斜めの虹色シーン（ホログラム反射のきらめき）
   const streak = c.createLinearGradient(0, 0, W, H);
   streak.addColorStop(0.30, "rgba(255,255,255,0)");
@@ -769,7 +836,7 @@ async function renderCard(d, theme = "jp") {
   // ===== ヘッダー =====
   c.textAlign = "left";
   c.textBaseline = "alphabetic";
-  c.fillStyle = "#11151c";
+  c.fillStyle = t.ink;
   c.font = "800 76px 'Hiragino Sans','Yu Gothic','Arial Black',sans-serif";
   c.fillText("NOSTR LICENSE", PAD, 118);
   c.fillStyle = t.accent;
@@ -988,6 +1055,11 @@ async function renderCard(d, theme = "jp") {
   c.fillText("NOSTR DRIVER PROFILE", tbX + 24, tbY + tbH / 2 + 1);
   c.restore();
 
+  // パネルは常にクリーム地なので、文字色はテーマに依らず常に濃色にする（galaxy対策）
+  const panelInk = t.dark ? "#22243f" : t.ink;
+  const panelSub = t.dark ? "#6b5e44" : t.sub;
+  const panelIcon = t.dark ? "#5e44b8" : t.accent;
+
   // ステータス 2列×3行（6項目）
   const stats = computeStars(d);
   const colX = [pnX + 40, pnX + 510];
@@ -996,8 +1068,8 @@ async function renderCard(d, theme = "jp") {
     const s = stats[i];
     const cxp = colX[i % 2];
     const cyp = rowsY[Math.floor(i / 2)];
-    drawStatIcon(c, s.icon, cxp, cyp - 15, 26, t.accent);
-    c.fillStyle = t.ink;
+    drawStatIcon(c, s.icon, cxp, cyp - 15, 26, panelIcon);
+    c.fillStyle = panelInk;
     c.textAlign = "left";
     c.textBaseline = "middle";
     c.font = "700 25px 'Hiragino Sans',sans-serif";
@@ -1011,17 +1083,17 @@ async function renderCard(d, theme = "jp") {
   c.globalAlpha = 1;
   const fy = pnY + 176;
   c.textAlign = "left"; c.textBaseline = "alphabetic";
-  c.fillStyle = t.sub; c.font = "700 18px 'Hiragino Sans',sans-serif";
+  c.fillStyle = panelSub; c.font = "700 18px 'Hiragino Sans',sans-serif";
   c.fillText("MILEAGE", colX[0], fy);
-  c.fillStyle = t.ink; c.font = "700 22px 'Hiragino Sans',sans-serif";
+  c.fillStyle = panelInk; c.font = "700 22px 'Hiragino Sans',sans-serif";
   c.fillText(String(d.activity) + (d.activityCapped ? "+" : ""), colX[0] + 104, fy);
-  c.fillStyle = t.sub; c.font = "700 18px 'Hiragino Sans',sans-serif";
+  c.fillStyle = panelSub; c.font = "700 18px 'Hiragino Sans',sans-serif";
   c.fillText("PEAK (UTC)", colX[1], fy);
-  c.fillStyle = t.ink; c.font = "700 22px 'Hiragino Sans',sans-serif";
+  c.fillStyle = panelInk; c.font = "700 22px 'Hiragino Sans',sans-serif";
   c.fillText(d.peakUTC || "—", colX[1] + 144, fy);
 
   // ===== 署名・AUTHORIZED・ホロ印（パネル右）=====
-  c.fillStyle = "#1b2336";
+  c.fillStyle = t.ink;
   c.textAlign = "center";
   c.textBaseline = "alphabetic";
   const sigText = d.handle || d.name || "";
@@ -1049,7 +1121,7 @@ async function renderCard(d, theme = "jp") {
   } else {
     drawCar(c, PAD, capY, t.accent);
   }
-  c.fillStyle = "#2a3550";
+  c.fillStyle = t.ink;
   c.textAlign = "left";
   c.textBaseline = "middle";
   c.font = "600 25px 'Hiragino Sans',sans-serif";
