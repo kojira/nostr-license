@@ -871,7 +871,13 @@ async function renderCard(d, theme = "jp") {
   const rank = computeRank(d);
 
   // ===== 写真（中央右）=====
-  const phX = 850, phY = 202, phW = 360, phH = 468, phR = 16;
+  // 正方形モード：枠を正方形にして元のポートレート枠(202..670)内で縦中央寄せ。
+  // アイコン(1:1)を左右切り取りなしで全体表示できる。幅は通常と同じ360で右カラム余白を維持。
+  const squareAvatar = !!$("square-avatar")?.checked;
+  const phX = 850, phR = 16;
+  const phW = 360;
+  const phH = squareAvatar ? 360 : 468;
+  const phY = squareAvatar ? 202 + (468 - phH) / 2 : 202;
   c.save();
   c.shadowColor = "rgba(30,40,80,0.28)";
   c.shadowBlur = 26;
@@ -885,7 +891,10 @@ async function renderCard(d, theme = "jp") {
   c.clip();
   if (d._avatar) {
     const img = d._avatar;
-    const ratio = Math.max(phW / img.width, phH / img.height);
+    // 正方形モードは contain（全体表示）、通常はポートレート枠に cover（はみ出し切り取り）
+    const ratio = squareAvatar
+      ? Math.min(phW / img.width, phH / img.height)
+      : Math.max(phW / img.width, phH / img.height);
     const dw = img.width * ratio, dh = img.height * ratio;
     c.drawImage(img, phX + (phW - dw) / 2, phY + (phH - dh) / 2, dw, dh);
   } else {
@@ -1207,6 +1216,16 @@ $("manual-btn").addEventListener("click", async () => {
 $("theme-select").addEventListener("change", () => {
   if (lastData) renderCard(lastData, $("theme-select").value);
 });
+
+// ===== アイコン正方形表示トグル =====
+try {
+  const sq = $("square-avatar");
+  if (localStorage.getItem("nl_square") === "1") sq.checked = true;
+  sq.addEventListener("change", () => {
+    try { localStorage.setItem("nl_square", sq.checked ? "1" : "0"); } catch {}
+    if (lastData) renderCard(lastData, $("theme-select").value);
+  });
+} catch {}
 
 // ===== リレーエディタ =====
 function addRelayRow(value = "") {
