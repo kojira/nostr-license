@@ -208,3 +208,43 @@ main {
 .info summary { cursor: pointer; color: var(--text); }
 .info code { background: var(--panel-2); padding: 1px 6px; border-radius: 5px; }
 .info ul { line-height: 1.7; }
+
+/* ===== リレー取得進捗（リレーごとライブ表示） ===== */
+.fetch-progress {
+  margin-top: 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.rp-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.rp-total { color: var(--accent-2); font-variant-numeric: tabular-nums; }
+.relay-prog-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.relay-prog {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.rp-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.rp-host { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rp-status { color: var(--muted); font-size: 12px; }
+.rp-meta { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 12px; min-width: 56px; text-align: right; }
+/* 状態別の色 */
+.relay-prog.rs-active .rp-dot { background: var(--accent); animation: rp-pulse 1s ease-in-out infinite; }
+.relay-prog.rs-active .rp-status { color: var(--accent); }
+.relay-prog.rs-ok .rp-dot { background: var(--accent-2); }
+.relay-prog.rs-ok .rp-status { color: var(--accent-2); }
+.relay-prog.rs-empty .rp-dot { background: var(--muted); }
+.relay-prog.rs-fail .rp-dot { background: #ff7b7b; }
+.relay-prog.rs-fail .rp-status { color: #ff7b7b; }
+.relay-prog.rs-idle .rp-dot { background: #c9a227; }
+@keyframes rp-pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.7); } }

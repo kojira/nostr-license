@@ -58,6 +58,7 @@
       </div>
 
       <p id="status" class="status"></p>
+      <div id="fetch-progress" class="fetch-progress" hidden></div>
     </section>
 
     <section class="preview">
@@ -89,12 +90,16 @@
         <li><strong>Get npub from NIP-07</strong>: pulls your public key from a NIP-07 extension (nos2x, Alby, …) into the input box. It does not sign anything.</li>
         <li>NIP-05 is actually verified against <code>/.well-known/nostr.json</code> (green ✓ = verified, red ✗ = mismatch, no mark = could not check).</li>
         <li><strong>Share to Nostr</strong> (appears when a NIP-07 extension is detected): uploads the card image (NIP-96) to a host you choose, then publishes a hashtagged <code>kind:1</code> note to the relays above. Every signature is approved in your extension; no private key leaves it.</li>
+        <li><strong>License Class</strong> = your tenure only (best-effort, from the oldest event we can find — an older account may read newer if relays pruned its history). Ostrich life cycle: <code>EGG</code> (&lt;1d) → <code>CHICK</code> (1–7d) → <code>JUVENILE</code> (7–30d) → <code>EXPLORER</code> (1mo–1y) → <code>CITIZEN</code> (1–3y) → <code>NOSTR OG</code> (3y+). The newcomer tiers line up with the Day-1 / Day-7 / Day-30 retention milestones.</li>
+        <li><strong>Endorsement</strong> = your standout type (a lateral archetype, not a rank): <code>CONNECTOR</code> (Web of Trust), <code>SPEEDSTER</code> (Velocity), <code>MARATHONER</code> (Streak), <code>ZAP MAGNET</code> (zaps received), <code>ZAPPER</code> (zaps sent), <code>COMMUNICATOR</code> (high Communication — active poster + interactions), <code>INFLUENCER</code> (interactions received ≫ sent), <code>SUPPORTER</code> (interactions sent ≫ received), <code>CASUAL</code> (no ★4+ standout), <code>LURKER</code> (barely active), <code>ALL-ROUNDER</code> (★4+ everywhere), and the rare <code>TERMINALLY ONLINE</code> (max Velocity AND Streak — the true addict).</li>
+        <li><strong>Communication</strong> (last 30 days) = your posting volume (50%) + your interaction volume (50% — reactions and reposts you send and receive). Posting volume stands in for tag-less "air-reply" chat (common on Japanese Nostr), which can't be detected from event structure. The send-vs-receive direction of your interactions drives the INFLUENCER / SUPPORTER endorsements.</li>
+        <li><strong>Streak</strong> = longest run of consecutive days with a post, walked day-by-day from your latest post until a gap (best-effort — limited by what your relays retain). Past 90 days it "prestiges": every +100 days powers up one of the five stars (bigger, hotter colour), cycling through all five and looping for higher tiers.</li>
         <li>This is a fan card for fun, not an official ID.</li>
         <li>If an avatar host doesn't allow CORS, the avatar may fall back to a placeholder in the downloaded image.</li>
       </ul>
     </details>
   </main>
 
-  <script type="module" src="app.js?v=27"></script>
+  <script type="module" src="app.js?v=57"></script>
 </body>
 </html>

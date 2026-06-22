@@ -37,65 +37,251 @@ function setStatus(msg, kind = "") {
   el.className = "status" + (kind ? " " + kind : "");
 }
 
-// ===== リレーへ REQ を投げてイベントを集める =====
-function queryRelays(filters, { relays = getActiveRelays(), timeoutMs = 4500 } = {}) {
-  return new Promise((resolve) => {
-    const events = new Map();
-    const sockets = [];
-    let settled = false;
-    let doneCount = 0;
-    const subId = "nl-" + Math.random().toString(36).slice(2, 10);
-    const total = relays.length;
+// リレーごとの取得進捗をライブ表示する（複数プールの stats を URL で合算）。
+function renderRelayProgress(pools, done) {
+  const el = document.getElementById("fetch-progress");
+  if (!el) return;
+  const byUrl = new Map();
+  for (const p of pools) {
+    for (const s of p.stats()) {
+      const cur = byUrl.get(s.url) || { url: s.url, events: 0, reqs: 0, active: 0, states: [] };
+      cur.events += s.events; cur.reqs += s.reqs; cur.active += s.active; cur.states.push(s.state);
+      byUrl.set(s.url, cur);
+    }
+  }
+  const rows = [...byUrl.values()].map((r) => {
+    const open = r.states.some((st) => st === "open");
+    const allFailed = r.states.length && r.states.every((st) => st === "failed");
+    let label, cls;
+    if (allFailed) { label = "接続失敗"; cls = "rs-fail"; }
+    else if (done) { label = r.events > 0 ? "完了" : "投稿なし"; cls = r.events > 0 ? "rs-ok" : "rs-empty"; }
+    else if (r.active > 0) { label = "取得中…"; cls = "rs-active"; }
+    else if (open) { label = "待機"; cls = "rs-idle"; }
+    else { label = "接続中…"; cls = "rs-idle"; }
+    const host = r.url.replace(/^wss?:\/\//, "");
+    return `<li class="relay-prog ${cls}"><span class="rp-dot"></span><span class="rp-host">${host}</span><span class="rp-status">${label}</span><span class="rp-meta">${r.events.toLocaleString()} 件</span></li>`;
+  }).join("");
+  const total = [...byUrl.values()].reduce((a, r) => a + r.events, 0);
+  el.hidden = false;
+  el.innerHTML = `<div class="rp-head"><span>${done ? "取得完了" : "リレーから取得中…"}</span><span class="rp-total">受信 ${total.toLocaleString()} 件</span></div><ul class="relay-prog-list">${rows}</ul>`;
+}
 
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      for (const ws of sockets) {
-        try { ws.close(); } catch {}
-      }
-      resolve([...events.values()]);
-    };
-
-    if (total === 0) { resolve([]); return; }
-    const timer = setTimeout(finish, timeoutMs);
-
-    relays.forEach((url) => {
+// ===== リレー接続プール =====
+// リレーごとに WebSocket を1本だけ永続化し、サブIDでクエリを多重化する。
+// 「呼び出しごとに新規ソケットを大量に開く」接続ストームを避けることで、
+// リレー側の切断・取りこぼしを減らし、取得件数を安定させる。
+function createPool(relays, { maxInflight = 16 } = {}) {
+  const conns = relays.map((url) => {
+    // state: connecting / open / failed（接続できず）/ closed（一度開いて閉じた）。
+    // events: このリレーから受信したイベント総数（進捗表示用）。reqs: 投げた REQ 数。
+    const c = { url, ws: null, ready: false, everReady: false, closed: false, subs: new Map(), queue: [], state: "connecting", events: 0, reqs: 0 };
+    const connect = () => {
+      if (c.closed) return;
       let ws;
-      try {
-        ws = new WebSocket(url);
-      } catch {
-        doneCount++;
-        return;
-      }
-      sockets.push(ws);
-
+      try { ws = new WebSocket(url); } catch { c.state = "failed"; return; }
+      c.ws = ws;
       ws.onopen = () => {
-        try {
-          ws.send(JSON.stringify(["REQ", subId, ...filters]));
-        } catch {}
+        c.ready = true; c.everReady = true; c.state = "open";
+        for (const m of c.queue) { try { ws.send(m); } catch {} }
+        c.queue = [];
       };
       ws.onmessage = (e) => {
-        let data;
-        try { data = JSON.parse(e.data); } catch { return; }
-        if (!Array.isArray(data)) return;
-        if (data[0] === "EVENT" && data[1] === subId && data[2]) {
-          const ev = data[2];
-          events.set(ev.id, ev);
-        } else if (data[0] === "EOSE" && data[1] === subId) {
-          try { ws.close(); } catch {}
-        }
+        let d; try { d = JSON.parse(e.data); } catch { return; }
+        if (!Array.isArray(d)) return;
+        const sub = c.subs.get(d[1]); if (!sub) return;
+        if (d[0] === "EVENT" && d[2]) { c.events++; sub.onEvent(d[2]); }
+        else if (d[0] === "EOSE") sub.onEose();
+        else if (d[0] === "CLOSED") sub.onClosed();   // リレーがサブを拒否/打ち切り＝不完全
       };
-      const markDone = () => {
-        doneCount++;
-        if (doneCount >= total) {
-          clearTimeout(timer);
-          finish();
-        }
+      ws.onclose = () => {
+        c.ready = false; c.ws = null;
+        c.state = c.everReady ? "closed" : "failed";
+        for (const sub of [...c.subs.values()]) sub.onDrop();
       };
-      ws.onclose = markDone;
-      ws.onerror = () => { try { ws.close(); } catch {} };
-    });
+      ws.onerror = () => { if (!c.everReady) c.state = "failed"; };
+    };
+    c.send = (m) => {
+      if (m.startsWith('["REQ')) c.reqs++;
+      if (c.ready && c.ws) { try { c.ws.send(m); } catch { c.queue.push(m); } }
+      else { c.queue.push(m); if (!c.ws && !c.closed) connect(); }
+    };
+    connect();
+    return c;
   });
+
+  let subN = 0;
+
+  // 同時サブスク数を制限（接続あたりの上限超過で CLOSED 拒否される取りこぼしを防ぐ）。
+  let inflight = 0;
+  const waiters = [];
+  const acquire = () => new Promise((res) => {
+    if (inflight < maxInflight) { inflight++; res(); } else waiters.push(res);
+  });
+  const release = () => {
+    inflight--;
+    if (waiters.length && inflight < maxInflight) { inflight++; waiters.shift()(); }
+  };
+
+  // 全イベントを収集して返す。戻り値の .complete = 接続できた全リレーが EOSE を返したか。
+  // CLOSED（拒否/打ち切り）は EOSE と区別し、不完全扱い → queryStable が再取得する。
+  const rawQuery = (filters, { timeoutMs = 9000 } = {}) => new Promise((resolve) => {
+    const subId = "q" + (subN++);
+    const events = new Map();
+    const eosed = new Set();
+    const finished = new Set();
+    let settled = false;
+    const total = conns.length;
+    const finish = () => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      for (const c of conns) {
+        c.subs.delete(subId);
+        if (c.ready && c.ws) { try { c.ws.send(JSON.stringify(["CLOSE", subId])); } catch {} }
+      }
+      const expected = conns.filter((c) => c.everReady).length;
+      const out = [...events.values()];
+      out.complete = expected > 0 && eosed.size >= expected;
+      resolve(out);
+    };
+    if (total === 0) { const o = []; o.complete = true; return resolve(o); }
+    const timer = setTimeout(finish, timeoutMs);
+    for (const c of conns) {
+      const mark = () => { finished.add(c.url); if (finished.size >= total) finish(); };
+      c.subs.set(subId, {
+        onEvent: (ev) => { events.set(ev.id, ev); },
+        onEose: () => { eosed.add(c.url); mark(); },
+        onClosed: () => { mark(); },   // eosed に入れない = 不完全
+        onDrop: () => { mark(); },
+      });
+      c.send(JSON.stringify(["REQ", subId, ...filters]));
+    }
+  });
+
+  // 1件でも EVENT が来たら即 true、全 EOSE/CLOSED/タイムアウトで false（Streak 日次判定用）。
+  const rawHas = (filter, { timeoutMs = 2500 } = {}) => new Promise((resolve) => {
+    const subId = "h" + (subN++);
+    const finished = new Set();
+    let settled = false;
+    const total = conns.length;
+    const done = (val) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      for (const c of conns) {
+        c.subs.delete(subId);
+        if (c.ready && c.ws) { try { c.ws.send(JSON.stringify(["CLOSE", subId])); } catch {} }
+      }
+      resolve(val);
+    };
+    if (total === 0) return resolve(false);
+    const timer = setTimeout(() => done(false), timeoutMs);
+    for (const c of conns) {
+      const mark = () => { finished.add(c.url); if (finished.size >= total) done(false); };
+      c.subs.set(subId, { onEvent: () => done(true), onEose: mark, onClosed: mark, onDrop: mark });
+      c.send(JSON.stringify(["REQ", subId, filter]));
+    }
+  });
+
+  // 単一リレーへのクエリ（リレーごとに独立ページングするため）。.complete = そのリレーが EOSE したか。
+  const rawQueryOne = (url, filters, { timeoutMs = 9000 } = {}) => new Promise((resolve) => {
+    const c = conns.find((x) => x.url === url);
+    if (!c) { const o = []; o.complete = false; return resolve(o); }
+    const subId = "o" + (subN++);
+    const events = new Map();
+    let settled = false, eosed = false;
+    const finish = () => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      c.subs.delete(subId);
+      if (c.ready && c.ws) { try { c.ws.send(JSON.stringify(["CLOSE", subId])); } catch {} }
+      const out = [...events.values()]; out.complete = eosed; resolve(out);
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    c.subs.set(subId, {
+      onEvent: (ev) => { events.set(ev.id, ev); },
+      onEose: () => { eosed = true; finish(); },
+      onClosed: () => { finish(); },   // 拒否/打ち切り = 不完全
+      onDrop: () => { finish(); },
+    });
+    c.send(JSON.stringify(["REQ", subId, ...filters]));
+  });
+
+  const query = async (filters, opts) => {
+    await acquire();
+    try { return await rawQuery(filters, opts); } finally { release(); }
+  };
+  const has = async (filter, opts) => {
+    await acquire();
+    try { return await rawHas(filter, opts); } finally { release(); }
+  };
+  const queryOne = async (url, filters, opts) => {
+    await acquire();
+    try { return await rawQueryOne(url, filters, opts); } finally { release(); }
+  };
+
+  // リレーごとの進捗スナップショット（state / 受信イベント数 / 進行中サブ数 / REQ数）。
+  const stats = () => conns.map((c) => ({ url: c.url, state: c.state, events: c.events, reqs: c.reqs, active: c.subs.size }));
+
+  const close = () => { for (const c of conns) { c.closed = true; try { c.ws && c.ws.close(); } catch {} } };
+  return { query, has, queryOne, close, stats, size: relays.length, urls: relays.slice() };
+}
+
+// 全リレー merged の未完了なら再取得してマージ（単発クエリ・浅い探索用）。
+async function queryStable(pool, filters, { timeoutMs = 9000, retries = 2 } = {}) {
+  let evs = await pool.query(filters, { timeoutMs });
+  let t = 0;
+  while (!evs.complete && t < retries) {
+    t++;
+    const more = await pool.query(filters, { timeoutMs: timeoutMs + 3000 * t });
+    const m = new Map();
+    for (const e of evs) m.set(e.id, e);
+    for (const e of more) m.set(e.id, e);
+    const merged = [...m.values()];
+    merged.complete = more.complete;
+    evs = merged;
+  }
+  return evs;
+}
+
+// 単一リレーの未完了（EOSE 前にタイムアウト/CLOSED）なら再取得してマージ。
+async function queryStableOne(pool, url, filters, { timeoutMs = 9000, retries = 2 } = {}) {
+  let evs = await pool.queryOne(url, filters, { timeoutMs });
+  let t = 0;
+  while (!evs.complete && t < retries) {
+    t++;
+    const more = await pool.queryOne(url, filters, { timeoutMs: timeoutMs + 3000 * t });
+    const m = new Map();
+    for (const e of evs) m.set(e.id, e);
+    for (const e of more) m.set(e.id, e);
+    const merged = [...m.values()];
+    merged.complete = more.complete;
+    evs = merged;
+  }
+  return evs;
+}
+
+// ===== until を遡って全件をページ収集（リレーの limit 上限を越えて過去も集める）=====
+// 【リレーごとに独立してページング】する。merged で全リレー共通の until を使うと、
+// 保持密度の違うリレーが混ざったとき、疎なリレーの古いイベントが until を引き下げて
+// 密なリレーの中間データを丸ごと飛ばす（=大量取りこぼし）ため。各リレーを単独で
+// 末尾まで辿り、最後に id で統合する。
+async function fetchAllPaged(filterBase, pool, { maxPages = 6, pageLimit = 500, timeoutMs = 9000 } = {}) {
+  const all = new Map();
+  await Promise.all(pool.urls.map(async (url) => {
+    let until = null;
+    for (let i = 0; i < maxPages; i++) {
+      const f = { ...filterBase, limit: pageLimit };
+      if (until != null) f.until = until - 1;
+      const evs = await queryStableOne(pool, url, [f], { timeoutMs });
+      let minTs = Infinity;
+      for (const e of evs) {
+        if (!all.has(e.id)) all.set(e.id, e);
+        if (e.created_at < minTs) minTs = e.created_at;
+      }
+      if (!evs.length) break;
+      if (until != null && minTs >= until) break;          // 進捗なし
+      until = minTs;
+      // 単一リレーなので「完全応答で上限未満 = そのリレーは枯渇」と判断してよい。
+      if (evs.complete && evs.length < pageLimit) break;
+    }
+  }));
+  return [...all.values()];
 }
 
 // ===== ユーティリティ：イベント集合の最新/最古 created_at =====
@@ -115,35 +301,41 @@ function tagValues(ev, name) {
   return ev.tags.filter((t) => t[0] === name).map((t) => t[1]).filter(Boolean);
 }
 
-// ===== until を遡って全件をページ収集（リレーの limit 上限を越えて過去も集める）=====
-// filterBase: {kinds, authors, "#p" ...}（limit/until は内部で付与）
-async function fetchAllPaged(filterBase, relays, { maxPages = 5, pageLimit = 500, timeoutMs = 3500 } = {}) {
-  const all = new Map();
-  let until = null;
-  for (let i = 0; i < maxPages; i++) {
-    const f = { ...filterBase, limit: pageLimit };
-    if (until != null) f.until = until - 1;
-    const evs = await queryRelays([f], { relays, timeoutMs });
-    if (!evs.length) break;
-    let minTs = Infinity;
-    for (const e of evs) {
-      if (!all.has(e.id)) all.set(e.id, e);
-      if (e.created_at < minTs) minTs = e.created_at;
+// ===== Streak 計測：最新投稿日から1日ずつ limit:1 で「その日に投稿があるか」を並列チェックし、
+//        最初のギャップ（投稿の無い日）で停止。共有プールで安定取得する。
+//        各日は EVENT 即 true、空なら再クエリで確認（瞬間的な取りこぼしでギャップ誤検出しない）。=====
+async function measureStreak(pubkeyHex, pool, latestTs, { maxDays = 2000, budgetMs = 55000, batch = 45, perTimeout = 2500, retries = 2 } = {}) {
+  const anchorDay = Math.floor((latestTs || Math.floor(Date.now() / 1000)) / 86400);
+  if (!pool || !pool.size) return { streak: 0, capped: false, reason: "no-open", opens: 0 };
+
+  const dayHasPost = async (k) => {
+    const dayStart = (anchorDay - k) * 86400;
+    const filter = { kinds: [1], authors: [pubkeyHex], since: dayStart, until: dayStart + 86399, limit: 1 };
+    for (let a = 0; a <= retries; a++) {
+      if (await pool.has(filter, { timeoutMs: perTimeout * (a + 1) })) return true;
     }
-    if (until != null && minTs >= until) break; // 進捗なし
-    until = minTs;
-    if (evs.length < pageLimit) break;          // これ以上古いものは無い
+    return false;
+  };
+
+  const t0 = Date.now();
+  let streak = 0, capped = false, k = 0;
+  while (k < maxDays) {
+    if (Date.now() - t0 > budgetMs) { capped = true; break; }
+    const ks = []; for (let j = 0; j < batch && k + j < maxDays; j++) ks.push(k + j);
+    const res = await Promise.all(ks.map(dayHasPost));
+    let gap = -1;
+    for (let j = 0; j < res.length; j++) { if (res[j]) streak = ks[j] + 1; else { gap = ks[j]; break; } }
+    if (gap >= 0) return { streak: gap, capped: false, reason: "gap@" + gap, opens: pool.size };
+    k += batch;
   }
-  return [...all.values()];
+  if (k >= maxDays) capped = true;
+  return { streak, capped, reason: capped ? "cap" : "end", opens: pool.size };
 }
 
-// ===== 最古イベント（利用開始の推定）=====
-// 1) 3ヶ月刻みで until を過去へ下げ、イベントのある最古帯まで一気に降りる
-//    （新しい順しか返らない relay でも、密なリアクションに阻まれず最古帯を掴める）
 // 2) 最古帯から limit:500 のページングで「これ以上古いものが無い」所まで詰める
 //    探索対象は kind:1/0/3（投稿・プロフィール作成・初期フォロー）。reaction(7) は除外。
 const MONTH_SEC = 30.44 * 24 * 3600;
-async function findEarliest(pubkeyHex, relays, seedMin) {
+async function findEarliest(pubkeyHex, pool, seedMin) {
   const now = Math.floor(Date.now() / 1000);
   let earliest = seedMin != null ? seedMin : now;
   const kinds = [1, 0, 3];
@@ -153,9 +345,9 @@ async function findEarliest(pubkeyHex, relays, seedMin) {
   let empties = 0;
   for (let mo = 3; mo <= 144; mo += 3) {
     const until = Math.floor(now - mo * MONTH_SEC);
-    const evs = await queryRelays(
+    const evs = await queryStable(pool,
       [{ kinds, authors: [pubkeyHex], until, limit: 200 }],
-      { relays, timeoutMs: 4500 }
+      { timeoutMs: 7000 }
     );
     if (!evs.length) { if (++empties >= 2) break; continue; }
     empties = 0;
@@ -166,9 +358,9 @@ async function findEarliest(pubkeyHex, relays, seedMin) {
   // 2) 仕上げ drill：最古帯からさらに限界まで遡る
   let until = earliest;
   for (let i = 0; i < 12; i++) {
-    const evs = await queryRelays(
+    const evs = await queryStable(pool,
       [{ kinds, authors: [pubkeyHex], until: until - 1, limit: 500 }],
-      { relays, timeoutMs: 5000 }
+      { timeoutMs: 7000 }
     );
     if (!evs.length) break;
     const m = Math.min(...evs.map((e) => e.created_at));
@@ -187,10 +379,12 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
   const selected = getActiveRelays();
 
   // --- Phase A: 選択リレーで軽量取得（profile / relay list）---
+  // 接続プールを1つ張り、以降の全取得をこの永続接続に多重化する（接続ストーム回避）。
   setStatus("Fetching profile and relay list…");
+  const poolA = createPool(selected);
   const [metaEvents, relayListEvents] = await Promise.all([
-    queryRelays([{ kinds: [0], authors: [t], limit: 5 }], { relays: selected }),
-    queryRelays([{ kinds: [10002], authors: [t], limit: 5 }], { relays: selected }),
+    queryStable(poolA, [{ kinds: [0], authors: [t], limit: 5 }], { timeoutMs: 7000 }),
+    queryStable(poolA, [{ kinds: [10002], authors: [t], limit: 5 }], { timeoutMs: 7000 }),
   ]);
 
   const meta = latest(metaEvents);
@@ -206,21 +400,47 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     ? [...new Set([...selected, ...userRelays])]
     : selected;
 
+  // working が selected と同じなら Phase A のプールを使い回す。違えば張り直す。
+  const pool = (working === selected) ? poolA : createPool(working);
+  if (pool !== poolA) poolA.close();
+  // Streak は大量の has() を撃つので、取得系と接続を分けて互いに干渉させない（高速化）。
+  const streakPool = createPool(working);
+
+  // リレーごとの取得進捗をライブ表示（200ms 間隔でポーリング描画）。
+  const progPools = [pool, streakPool];
+  renderRelayProgress(progPools, false);
+  const progTimer = setInterval(() => renderRelayProgress(progPools, false), 200);
+
+  try {
   // --- Phase B: working リレーで本取得（過去も遡って集計）---
   // まず投稿の先頭ページを取り、利用開始推定の起点(seedMin)にする
   setStatus("Fetching activity, followers, and zaps through history…");
-  const notes0 = await queryRelays([{ kinds: [1], authors: [t], limit: 500 }], { relays: working });
+  const notes0 = await queryStable(pool, [{ kinds: [1], authors: [t], limit: 500 }], { timeoutMs: 8000 });
   const seedMin = notes0.length ? Math.min(...notes0.map((e) => e.created_at)) : (meta ? meta.created_at : null);
 
-  // ページング取得（リレー上限を越えて過去も）＋最古推定＋NIP-05検証を並列実行
-  const [noteEvents, followerEvents, zapRecvEvents, zapSentEvents, contactsEvents, sinceAt, nip05Verified] = await Promise.all([
-    fetchAllPaged({ kinds: [1], authors: [t] }, working, { maxPages: 5 }),
-    fetchAllPaged({ kinds: [3], "#p": [t] }, working, { maxPages: 3 }),
-    fetchAllPaged({ kinds: [9735], "#p": [t] }, working, { maxPages: 6 }), // Zap 受信
-    fetchAllPaged({ kinds: [9735], "#P": [t] }, working, { maxPages: 6 }), // Zap 送信（大文字 P）
-    queryRelays([{ kinds: [3], authors: [t], limit: 5 }], { relays: working }),
-    findEarliest(t, working, seedMin),
+  // 最新投稿日（Streak ウォークの起点）
+  const latestTs = notes0.length ? Math.max(...notes0.map((e) => e.created_at)) : Math.floor(Date.now() / 1000);
+
+  // Communication 用：リアクション送受信は【直近30日】の同一窓で取る（件数打ち切りだと
+  // 送信/受信でカバー期間がズレて比率が歪むため）。重量級ユーザーでも収まるようページ多め。
+  const reactWindowDays = 30;
+  const reactSince = Math.floor(Date.now() / 1000) - reactWindowDays * 86400;
+
+  // ページング取得（リレー上限を越えて過去も）＋最古推定＋NIP-05検証＋Streak を並列実行。
+  // ※ 取得はリレーごとの独立ページング（fetchAllPaged）なので、密度差による取りこぼしは無い。
+  const [noteEvents, followerEvents, zapRecvEvents, zapSentEvents, reactSentEvents, reactRecvEvents, repostSentEvents, repostRecvEvents, contactsEvents, sinceAt, nip05Verified, streakInfo] = await Promise.all([
+    fetchAllPaged({ kinds: [1], authors: [t] }, pool, { maxPages: 5 }),
+    fetchAllPaged({ kinds: [3], "#p": [t] }, pool, { maxPages: 3 }),
+    fetchAllPaged({ kinds: [9735], "#p": [t] }, pool, { maxPages: 6 }), // Zap 受信
+    fetchAllPaged({ kinds: [9735], "#P": [t] }, pool, { maxPages: 6 }), // Zap 送信（大文字 P）
+    fetchAllPaged({ kinds: [7], authors: [t], since: reactSince }, pool, { maxPages: 6 }), // リアクション送信（直近30日）
+    fetchAllPaged({ kinds: [7], "#p": [t], since: reactSince }, pool, { maxPages: 6 }),    // リアクション受信（直近30日）
+    fetchAllPaged({ kinds: [6], authors: [t], since: reactSince }, pool, { maxPages: 6 }), // リポスト送信（直近30日）
+    fetchAllPaged({ kinds: [6], "#p": [t], since: reactSince }, pool, { maxPages: 6 }),    // リポスト受信（直近30日）
+    queryStable(pool, [{ kinds: [3], authors: [t], limit: 5 }], { timeoutMs: 7000 }),
+    findEarliest(t, pool, seedMin),
     verifyNip05(profile.nip05, t),
+    measureStreak(t, streakPool, latestTs).catch(() => ({ streak: 0, capped: false })),
   ]);
 
   // フォロワー集合（kind:3 の発行者。自分は除外）
@@ -240,6 +460,28 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
   // Zap 件数（送受信を分離。重複は id で除去済み）
   const zapRecv = zapRecvEvents.length;
   const zapSent = zapSentEvents.length;
+
+  // Communication（直近30日・活動量ベース）。日本の Nostr はタグ無しエアリプで会話する
+  // ため、構造的に拾える「リアクション/リポストの送受信」だけだと会話量を取りこぼす。
+  // そこで【投稿量50% + インタラクション量50%】で算出する（投稿の多さ＝エアリプ会話の代理）。
+  const reactionsSent = reactSentEvents.length;
+  const reactionsRecv = reactRecvEvents.length;
+  const repostSent = repostSentEvents.length;
+  const repostRecv = repostRecvEvents.length;
+  // 直近30日の投稿数（エアリプ会話の代理指標）
+  const postsRecent = noteEvents.filter((e) => e.created_at >= reactSince).length;
+  // インタラクション総量と、向き（INFLUENCER/SUPPORTER 判定用）の受信・送信合計
+  const interactions = reactionsSent + reactionsRecv + repostSent + repostRecv;
+  const commInbound = reactionsRecv + repostRecv;   // 受け取った絡み
+  const commOutbound = reactionsSent + repostSent;   // 自分から絡んだ量
+
+  // 連続投稿日数：日次ウォークの結果を採用（取れなければ収集ノートからフォールバック）。
+  // capped=true は「上限/時間で打ち切り＝実際はもっと長いかも（+表示）」。
+  let streak = (streakInfo && streakInfo.streak) || 0;
+  const streakCapped = !!(streakInfo && streakInfo.capped);
+  let streakReason = (streakInfo && streakInfo.reason) || "none";
+  const streakOpens = (streakInfo && streakInfo.opens) || 0;
+  if (!streak) { streak = longestStreak(noteEvents.map((e) => e.created_at)); streakReason = "fallback(" + streakReason + ")"; }
 
   // WoT = 相互フォロー数（対象の follow ∩ 対象の follower）。
   // npub だけで計算でき、秘密鍵も NIP-07 も不要（取得元が違っても結果は同じ）。
@@ -267,6 +509,18 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     relayCount,
     zapRecv,
     zapSent,
+    reactionsSent,
+    reactionsRecv,
+    repostSent,
+    repostRecv,
+    postsRecent,
+    interactions,
+    commInbound,
+    commOutbound,
+    streak,
+    streakCapped,
+    streakReason,
+    streakOpens,
     wotValue,
     sinceAt,                            // 利用開始（最古イベント推定、取れなければ null）
     lastActivity: lastActivity || sinceAt || Math.floor(Date.now() / 1000),
@@ -282,6 +536,12 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     peakUTC: peakBand(noteEvents.map((e) => e.created_at)),  // 最も活発な時間帯
     usedRelays: working,
   };
+  } finally {
+    clearInterval(progTimer);
+    renderRelayProgress(progPools, true);   // 最終スナップショット（完了表示）
+    pool.close();
+    streakPool.close();
+  }
 }
 
 // ===== NIP-05 検証 =====
@@ -312,12 +572,19 @@ async function verifyNip05(nip05, pubkeyHex) {
 }
 
 // ===== ランク（実データ基準）=====
+// LICENSE CLASS = 在籍期間のみ（ダチョウのライフサイクル）。Nostr は作成日が無いので
+// 「取得できた最古イベント」基準の best-effort（古参ほど過小評価され得る＝Nostr的に許容）。
+// 新人期は Day1/7/30 の離脱クリフに連動。
 function computeRank(d) {
-  const ageYears = d.sinceAt ? (Date.now() / 1000 - d.sinceAt) / (365.25 * 24 * 3600) : 0;
-  if (ageYears >= 3 || d.followers >= 300) return "NOSTR VETERAN";
-  if (d.followers >= 50 || d.activity >= 300) return "NOSTR CITIZEN";
-  if (d.activity >= 10 || d.hasNip05) return "RELAY EXPLORER";
-  return "BEGINNER NOSTR USER";
+  const c = d.sinceAt;
+  if (!c) return "EGG";
+  const ageDays = (Date.now() / 1000 - c) / 86400;
+  if (ageDays >= 365 * 3) return "NOSTR OG";   // 3年+
+  if (ageDays >= 365) return "CITIZEN";        // 1〜3年
+  if (ageDays >= 30) return "EXPLORER";        // 1ヶ月〜1年（一人前のダチョウ）
+  if (ageDays >= 7) return "JUVENILE";         // 7〜30日（走り回る若鳥）
+  if (ageDays >= 1) return "CHICK";            // 1〜7日（孵化したヒナ）
+  return "EGG";                                // 〜1日（卵）
 }
 
 // 実数 → ★(1..5)。log スケール。
@@ -335,16 +602,69 @@ function peakBand(timestamps) {
   const p = (n) => String(n).padStart(2, "0");
   return `${p(bi)}–${p((bi + 2) % 24)} UTC`;
 }
+// 最長連続投稿日数（連続した「日」のラン）
+function longestStreak(timestamps) {
+  const days = [...new Set(timestamps.map((t) => Math.floor(t / 86400)))].sort((a, b) => a - b);
+  if (!days.length) return 0;
+  let best = 1, cur = 1;
+  for (let i = 1; i < days.length; i++) {
+    if (days[i] === days[i - 1] + 1) { cur++; best = Math.max(best, cur); } else { cur = 1; }
+  }
+  return best;
+}
+// Streak の★：90日で★5（厳しめスケール）
+function streakStar(s) {
+  return s >= 90 ? 5 : s >= 60 ? 4 : s >= 30 ? 3 : s >= 14 ? 2 : 1;
+}
+// 90日超のプレステージ強化：100日ごとに星を1つずつ（1→2→…→5→1…）レベルアップ。
+// 各星のレベル = floor((steps + 4 - i) / 5)。0=通常。190日未満は強化なし(null)。
+function streakPrestige(s) {
+  if (s < 90) return null;
+  const steps = Math.floor((s - 90) / 100);
+  if (steps <= 0) return null;
+  const levels = [];
+  for (let i = 0; i < 5; i++) levels.push(Math.floor((steps + 4 - i) / 5));
+  return levels;
+}
+
 // ステータス（6項目・すべて実データ）。2列×3行で表示。各 {label, n, note, icon}
 function computeStars(d) {
+  // Communication = 投稿量50% + インタラクション量50%（直近30日・対数スケール）。
+  // 投稿の多さはタグ無しエアリプ会話の代理。インタラクションはリアクション/リポストの送受信合計。
+  const postStar = starFrom(d.postsRecent || 0, 1.5);
+  const interactionStar = starFrom(d.interactions || 0, 1.5);
+  const commStar = Math.max(1, Math.min(5, Math.round(0.5 * postStar + 0.5 * interactionStar)));
   return [
-    { label: "Communication", icon: "bubble", n: starFrom(d.activity, 1.6), note: d.activity + (d.activityCapped ? "+" : "") },
+    { label: "Communication", icon: "person", n: commStar, note: `${d.postsRecent || 0}p+${d.interactions || 0}i` },
     { label: "Web of Trust", icon: "shield", n: starFrom(d.wotValue, 1.6), note: String(d.wotValue) },
-    { label: "Relay Handling", icon: "relay", n: starFrom(d.relayCount, 3.7, 0), note: String(d.relayCount) },
     { label: "Velocity", icon: "relay", n: starFrom(d.velocity, 2.5), note: (d.velocity || 0).toFixed(1) + "/d" },
+    { label: "Streak", icon: "bubble", n: streakStar(d.streak || 0), note: (d.streak || 0) + "d" + (d.streakCapped ? "+" : ""), prestige: streakPrestige(d.streak || 0) },
     { label: "Zap Received", icon: "bolt", n: starFrom(d.zapRecv, 1.6), note: String(d.zapRecv) },
     { label: "Zap Sent", icon: "bolt", n: starFrom(d.zapSent, 1.6), note: String(d.zapSent) },
   ];
+}
+
+// ENDORSEMENT = 突出した特性のアーキタイプ（★4以上の突出のみ・横並びの型）
+function computeEndorsement(d) {
+  const st = {};
+  for (const x of computeStars(d)) st[x.label] = x.n;
+  const c = st["Communication"], w = st["Web of Trust"], v = st["Velocity"],
+        s = st["Streak"], zr = st["Zap Received"], zs = st["Zap Sent"];
+  const max = Math.max(c, w, v, s, zr, zs);
+  if (v >= 5 && s >= 5) return "TERMINALLY ONLINE";          // 廃人：投稿速度・連続ともMAX
+  if ([c, w, v, s, zr, zs].every((x) => x >= 4)) return "ALL-ROUNDER";
+  // 絡みの「向き」で称号（受信＝リアクション+リポスト受信、送信＝同送信・volume gate付き）
+  const out = d.commOutbound || 0, inb = d.commInbound || 0, VOL = 100;
+  if (inb >= 2 * Math.max(out, 1) && inb >= VOL) return "INFLUENCER"; // 受信≫送信＝反応される側
+  if (out >= 2 * Math.max(inb, 1) && out >= VOL) return "SUPPORTER";  // 送信≫受信＝盛り上げる側
+  if (max <= 2) return "LURKER";
+  if (max <= 3) return "CASUAL";
+  const cand = [
+    [v, "SPEEDSTER"], [s, "MARATHONER"], [c, "COMMUNICATOR"],
+    [zr, "ZAP MAGNET"], [zs, "ZAPPER"], [w, "CONNECTOR"],
+  ];
+  cand.sort((a, b) => b[0] - a[0]);
+  return cand[0][1];
 }
 
 // ===== 画像ロード（CORS対策のため weserv プロキシにフォールバック）=====
@@ -573,11 +893,39 @@ function drawStarRating(c, x, y, n, size, fill, empty) {
     c.fillText(i < n ? "★" : "☆", x + i * size * 0.96, y);
   }
 }
+// プレステージStreak：各星をレベルに応じて大きく・濃く（ヒートランプ＋発光）。
+// levels[i] = 強化レベル（0=通常）。レイアウト維持のためサイズ上限あり。
+const PRESTIGE_RAMP = ["#1e2a5a", "#caa11e", "#e8722a", "#d6402f", "#c01038", "#9a2bd0", "#6a1fb0"];
+function drawPrestigeStars(c, x, y, baseSize, levels) {
+  c.textAlign = "left";
+  c.textBaseline = "middle";
+  let cx = x;
+  for (let i = 0; i < 5; i++) {
+    const lv = levels[i] || 0;
+    const size = baseSize + Math.min(lv, 6) * 2.6;       // レベルで拡大（上限）
+    const col = PRESTIGE_RAMP[Math.min(lv, PRESTIGE_RAMP.length - 1)];
+    c.save();
+    if (lv >= 2) { c.shadowColor = col; c.shadowBlur = Math.min(lv, 6) * 3; }
+    c.font = `${size}px 'Hiragino Sans','Apple Color Emoji',sans-serif`;
+    c.fillStyle = col;
+    c.fillText("★", cx, y);
+    c.restore();
+    cx += size * 0.92;
+  }
+}
 // 角丸長方形のラベル（カプセル型ではなく控えめなR）
-function drawPill(c, text, x, y, { bg, fg, font, padX = 14, h = 34, r = 7 }) {
+function drawPill(c, text, x, y, { bg, fg, font, padX = 14, h = 34, r = 7, maxW = null }) {
   c.font = font;
   c.textAlign = "left";
   c.textBaseline = "middle";
+  if (maxW) { // 長いラベルは枠内に収まるまでフォント縮小
+    const m = font.match(/(\d+)px/);
+    let size = m ? +m[1] : 21;
+    while (size > 12 && c.measureText(text).width + padX * 2 > maxW) {
+      size -= 1;
+      c.font = font.replace(/\d+px/, size + "px");
+    }
+  }
   const w = c.measureText(text).width + padX * 2;
   roundRect(c, x, y, w, h, r);
   c.fillStyle = bg;
@@ -974,21 +1322,32 @@ async function renderCard(d, theme = "jp") {
     else { c.fillStyle = "#d23b3b"; c.fillText("✗", lx + aw + 12, 551); }
   }
 
-  // 下段3カラム（ISSUED / FIRST SEEN / LICENSE CLASS）
-  // 日付は控えめに細く小さく。パネルとの間に余白を確保。
+  // 下段：ISSUED / FIRST SEEN / CLASS / ENDORSEMENT を等間隔フローで（写真枠 phX 手前まで）。
   const THREE_YEARS = 3 * 365.25 * 24 * 3600;
   const rowY = 614;
-  const col = [lx, lx + 230, lx + 450];
-  c.fillStyle = t.sub;
-  c.font = "700 19px 'Hiragino Sans',sans-serif";
-  c.fillText("ISSUED", col[0], rowY);
-  c.fillText("FIRST SEEN", col[1], rowY);
-  c.fillText("LICENSE CLASS", col[2], rowY);
-  c.fillStyle = t.ink;
-  c.font = "400 25px 'Hiragino Sans',sans-serif";
-  c.fillText(fmtISO(Math.floor(Date.now() / 1000)), col[0], rowY + 32);
-  c.fillText(d.sinceAt ? fmtISO(d.sinceAt) : "—", col[1], rowY + 32);
-  drawPill(c, rank, col[2], rowY + 20, { bg: t.accent2, fg: "#fff", font: "700 21px 'Hiragino Sans',sans-serif", h: 34 });
+  const GAP = 46;
+  const fields = [
+    { label: "ISSUED",      kind: "date", text: fmtISO(Math.floor(Date.now() / 1000)) },
+    { label: "FIRST SEEN",  kind: "date", text: d.sinceAt ? fmtISO(d.sinceAt) : "—" },
+    { label: "CLASS",       kind: "pill", text: rank, bg: t.accent2 },
+    { label: "ENDORSEMENT", kind: "pill", text: computeEndorsement(d), bg: t.accent },
+  ];
+  let fx = lx;
+  for (const f of fields) {
+    c.textAlign = "left"; c.textBaseline = "alphabetic";
+    c.fillStyle = t.sub; c.font = "700 19px 'Hiragino Sans',sans-serif";
+    c.fillText(f.label, fx, rowY);
+    const lw = c.measureText(f.label).width;
+    let vw;
+    if (f.kind === "date") {
+      c.fillStyle = t.ink; c.font = "400 22px 'Hiragino Sans',sans-serif";
+      c.fillText(f.text, fx, rowY + 30);
+      vw = c.measureText(f.text).width;
+    } else {
+      vw = drawPill(c, f.text, fx, rowY + 14, { bg: f.bg, fg: "#fff", font: "700 20px 'Hiragino Sans',sans-serif", h: 32, maxW: (phX - 16) - fx });
+    }
+    fx += Math.max(lw, vw) + GAP;
+  }
 
   // ===== 右カラム：LICENSE NO / VALID THRU / シールド / QR =====
   const rlx = 1250;            // 右カラムの左揃え位置
@@ -1087,7 +1446,8 @@ async function renderCard(d, theme = "jp") {
     c.textBaseline = "middle";
     c.font = "700 25px 'Hiragino Sans',sans-serif";
     c.fillText(s.label, cxp + 42, cyp);
-    drawStarRating(c, cxp + 300, cyp, s.n, 26, "#1e2a5a", "#b9c1d7");
+    if (s.prestige) drawPrestigeStars(c, cxp + 300, cyp, 26, s.prestige);
+    else drawStarRating(c, cxp + 300, cyp, s.n, 26, "#1e2a5a", "#b9c1d7");
   }
 
   // パネル内フッター：PEAK のみ（Nostr は投稿数を正確に数えられないため MILEAGE は出さない）
@@ -1168,9 +1528,10 @@ async function issueFor(pubkeyHex) {
       data.nip05Verified === true ? " / NIP-05 ✓verified" :
       data.nip05Verified === false ? " / NIP-05 ✗mismatch" : " / NIP-05 unverifiable";
     setStatus(
-      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / relays ${data.relayCount} / vel ${(data.velocity || 0).toFixed(1)}/d / peak ${data.peakUTC} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
+      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / vel ${(data.velocity || 0).toFixed(1)}/d / streak ${data.streak}d${data.streakCapped ? "+" : ""} / comm ${data.postsRecent}p+${data.interactions}i (react ${data.reactionsSent}→/←${data.reactionsRecv}, rt ${data.repostSent}→/←${data.repostRecv}, 30d) / peak ${data.peakUTC} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
       "ok"
     );
+    refreshShareCaption();   // 解析数値を下のシェア用テキストボックスへ反映
   } catch (err) {
     console.error(err);
     setStatus("Error: " + (err?.message || err), "error");
@@ -1303,10 +1664,34 @@ function shareStatus(msg, kind = "") {
   if (el) { el.textContent = msg; el.className = "status" + (kind ? " " + kind : ""); }
 }
 
+const SITE_URL = "https://kojira.github.io/nostr-license/";
+
 function defaultCaption() {
-  return isJa()
-    ? "Nostr License を作ってみた！ #NostrLicense\nhttps://kojira.github.io/nostr-license/"
-    : "I made my Nostr License! #NostrLicense\nhttps://kojira.github.io/nostr-license/";
+  return "I made my Nostr License! #NostrLicense\n" + SITE_URL;
+}
+
+// シェア用キャプション（英語固定。カード・UI が英語なので統一）。カードは「★評価」しか
+// 描かないので、その裏付けとなる【実数値】を入れる（CLASS/ENDORSEMENT/PEAK/★自体は除く）。
+function statsCaption(d) {
+  const streak = (d.streak || 0) + "d" + (d.streakCapped ? "+" : "");
+  const vel = (d.velocity || 0).toFixed(1);
+  const core = `WoT ${d.wotValue} / velocity ${vel}/d / streak ${streak}`;
+  const zap = `⚡ zap received ${d.zapRecv} / sent ${d.zapSent}`;
+  const social = `👥 ${d.followers} followers / ${d.following} following`;
+  const comm = `💬 reactions ${d.reactionsRecv} in / ${d.reactionsSent} out · reposts ${d.repostRecv} in / ${d.repostSent} out (30d)`;
+  return `🪪 My Nostr License\n${core}\n${zap}\n${social}\n${comm}\n#NostrLicense\n${SITE_URL}`;
+}
+
+// 発行後にキャプションを更新（ユーザーが手編集していたら上書きしない）。
+let lastAutoCaption = "";
+function refreshShareCaption() {
+  const el = document.getElementById("post-caption");
+  if (!el) return;
+  const cur = el.value.trim();
+  if (cur && cur !== lastAutoCaption) return;   // 手編集済みは尊重
+  const cap = lastData ? statsCaption(lastData) : defaultCaption();
+  el.value = cap;
+  lastAutoCaption = cap;
 }
 
 function buildHostOptions() {
@@ -1424,7 +1809,7 @@ function initShare() {
   const box = $("share-box");
   if (!box || !box.hidden) return true; // already shown
   buildHostOptions();
-  $("post-caption").value = defaultCaption();
+  refreshShareCaption();
   $("post-btn").addEventListener("click", postToNostr);
   box.hidden = false;
   return true;
