@@ -2036,21 +2036,26 @@ DEFAULT_RELAYS.forEach((r) => addRelayRow(r));
   ctx.fillText("Enter an npub and press Issue", canvas.width / 2, canvas.height / 2);
 })();
 
+// 表＋裏を1枚に結合したカード画像（裏面が描かれていれば縦に連結、無ければ表のみ）。
+// ダウンロードと Nostr 投稿の両方で同じ画像を使う（Bluesky 版と同様に表裏を1枚で共有）。
+function composeCard() {
+  const back = document.getElementById("back-canvas");
+  if (!back || back.hidden) return canvas;
+  const out = document.createElement("canvas");
+  out.width = canvas.width; out.height = canvas.height * 2 + 32;
+  const oc = out.getContext("2d");
+  oc.fillStyle = "#0c1015"; oc.fillRect(0, 0, out.width, out.height);
+  oc.drawImage(canvas, 0, 0);
+  oc.drawImage(back, 0, canvas.height + 32);
+  return out;
+}
+
 $("download-btn").addEventListener("click", () => {
   try {
-    const back = document.getElementById("back-canvas");
-    if (back && !back.hidden) {
-      // 表裏を縦に並べて1枚のPNGに結合（表 → 裏）
-      const out = document.createElement("canvas");
-      out.width = canvas.width; out.height = canvas.height * 2 + 32;
-      const oc = out.getContext("2d");
-      oc.fillStyle = "#0c1015"; oc.fillRect(0, 0, out.width, out.height);
-      oc.drawImage(canvas, 0, 0);
-      oc.drawImage(back, 0, canvas.height + 32);
-      const a = document.createElement("a"); a.href = out.toDataURL("image/png"); a.download = "nostr-license.png"; a.click();
-    } else {
-      const a = document.createElement("a"); a.href = canvas.toDataURL("image/png"); a.download = "nostr-license.png"; a.click();
-    }
+    const a = document.createElement("a");
+    a.href = composeCard().toDataURL("image/png");
+    a.download = "nostr-license.png";
+    a.click();
   } catch (err) {
     setStatus("Download failed (possible avatar CORS restriction): " + err.message, "error");
   }
@@ -2076,16 +2081,12 @@ function defaultCaption() {
   return "I made my Nostr License! #NostrLicense\n" + SITE_URL;
 }
 
-// シェア用キャプション（英語固定。カード・UI が英語なので統一）。カードは「★評価」しか
-// 描かないので、その裏付けとなる【実数値】を入れる（CLASS/ENDORSEMENT/PEAK/★自体は除く）。
+// シェア用キャプション（英語固定）。実数値（WoT/velocity/streak/zap/followers…）は
+// 裏面カード（ACTIVITY RECORD）に数値で載り、投稿も表裏結合の1枚を共有するので、
+// キャプションに同じ数字を重複して入れない。短いタイトルとハッシュタグ・URL のみ。
 function statsCaption(d) {
-  const streak = (d.streak || 0) + "d" + (d.streakCapped ? "+" : "");
-  const vel = (d.velocity || 0).toFixed(1);
-  const core = `WoT ${d.wotValue} / velocity ${vel}/d / streak ${streak}`;
-  const zap = `⚡ zap received ${d.zapRecv} / sent ${d.zapSent}`;
-  const social = `👥 ${d.followers} followers / ${d.following} following`;
-  const comm = `💬 reactions ${d.reactionsRecv} in / ${d.reactionsSent} out · reposts ${d.repostRecv} in / ${d.repostSent} out (30d)`;
-  return `🪪 My Nostr License\n${core}\n${zap}\n${social}\n${comm}\n#NostrLicense\n${SITE_URL}`;
+  const who = d.name ? ` — ${d.name}` : "";
+  return `🪪 My Nostr License${who}\n#NostrLicense\n${SITE_URL}`;
 }
 
 // 発行後にキャプションを更新（ユーザーが手編集していたら上書きしない）。
@@ -2110,8 +2111,9 @@ function buildHostOptions() {
 }
 
 function canvasToBlob() {
+  // 投稿も表裏を結合した1枚で共有する（Bluesky 版と同様）。
   return new Promise((resolve, reject) =>
-    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("Could not export image (avatar CORS?)"))), "image/png")
+    composeCard().toBlob((b) => (b ? resolve(b) : reject(new Error("Could not export image (avatar CORS?)"))), "image/png")
   );
 }
 
