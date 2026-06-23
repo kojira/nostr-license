@@ -26,6 +26,14 @@
       </div>
 
       <div class="options">
+        <label>Fetch range
+          <select id="fetch-range">
+            <option value="90">3 months</option>
+            <option value="180">6 months</option>
+            <option value="365" selected>1 year</option>
+            <option value="0">All available (slow)</option>
+          </select>
+        </label>
         <label>Design
           <select id="theme-select">
             <option value="jp">Driver's license (blue)</option>
@@ -63,6 +71,7 @@
 
     <section class="preview">
       <canvas id="license-canvas" width="1568" height="984"></canvas>
+      <canvas id="back-canvas" class="back-canvas" width="1568" height="984" hidden></canvas>
       <div class="actions">
         <button id="download-btn" class="btn btn-primary" disabled>Download PNG</button>
       </div>
@@ -100,6 +109,6 @@
     </details>
   </main>
 
-  <script type="module" src="app.js?v=57"></script>
+  <script type="module" src="app.js?v=81"></script>
 </body>
 </html>

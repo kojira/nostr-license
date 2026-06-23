@@ -12,6 +12,37 @@ const $ = (id) => document.getElementById(id);
 const canvas = $("license-canvas");
 const ctx = canvas.getContext("2d");
 
+// Nostr の created_at は唯一の時刻でユーザーが詐称しうる（rkey-TID のような代替が無い）。
+// 緩い範囲外（2020以前・未来）は時系列集計から除外する best-effort なガード。
+const NOSTR_MIN = Date.parse("2020-01-01T00:00:00Z") / 1000;
+const saneSec = (s) => Number.isFinite(s) && s >= NOSTR_MIN && s <= Date.now() / 1000 + 86400;
+
+// bolt11 インボイスの HRP から金額を sats で取り出す。
+// HRP = ln + 通貨(bc/tb/...) + 金額 + 倍率(m/u/n/p) + "1"(区切り)。
+// 倍率→BTC: m=1e-3, u=1e-6, n=1e-9, p=1e-12。sats = BTC * 1e8。
+// 倍率なし = 整数 BTC。金額なし（lnbc1...）は null。
+function bolt11Sats(inv) {
+  if (typeof inv !== "string") return null;
+  const m = /^ln(?:bc|tb|bcrt|sb)(\d+)([munp])?1/i.exec(inv.toLowerCase());
+  if (!m) return null;
+  const num = parseInt(m[1], 10);
+  if (!Number.isFinite(num)) return null;
+  const factor = { "": 1e8, m: 1e5, u: 1e2, n: 0.1, p: 1e-4 };
+  return Math.round(num * factor[m[2] || ""]);
+}
+
+// kind:9735（Zap receipt）1件の金額を sats で返す。
+// 金額の真正な情報源は bolt11（実際に支払われたインボイス額）。description の
+// amount タグなどへのフォールバックは付けない（不具合を隠すため）。bolt11 が
+// 無い／パースできない受領は 0 とし、取りこぼしはそのまま表面化させる。
+function zapSats(ev) {
+  const tags = ev && ev.tags;
+  if (!Array.isArray(tags)) return 0;
+  const bolt11 = tags.find((x) => x[0] === "bolt11")?.[1];
+  const s = bolt11Sats(bolt11);
+  return s == null ? 0 : s;
+}
+
 // 画面のリレーエディタから現在のリレー一覧を収集（空・重複・不正は除外）
 function getActiveRelays() {
   const inputs = [...document.querySelectorAll("#relay-list .relay-input")];
@@ -24,9 +55,130 @@ function getActiveRelays() {
     v = v.replace(/\/+$/, "");
     if (seen.has(v)) continue;
     seen.add(v);
+    // primal cache service は標準リレーではない（独自 cache プロトコル）。
+    // 通常のフィルタ取得には混ぜず、zap 集計だけ専用パス（fetchPrimalZaps）で使う。
+    if (/(?:^|\.)primal\.net/i.test(v)) continue;
     out.push(v);
   }
   return out;
+}
+
+// ===== Primal cache service（zap 集計専用）=====
+// 標準リレーと違い ["REQ", id, {cache:[method, params]}] という独自プロトコル。
+// 送信 zap は description.pubkey で全ネットワーク index 済み（リレー直クエリの #P は
+// receipt の 0.4% しか拾えないため、ここで正確な送信総額を取る）。
+const PRIMAL_URL = "wss://cache2.primal.net/v1";
+function openPrimal() {
+  let ws;
+  try { ws = new WebSocket(PRIMAL_URL); } catch { return null; }
+  const subs = new Map();
+  const ready = new Promise((res, rej) => {
+    ws.onopen = () => res();
+    ws.onerror = () => rej(new Error("primal open failed"));
+  });
+  ws.onmessage = (e) => {
+    let d; try { d = JSON.parse(e.data); } catch { return; }
+    if (!Array.isArray(d)) return;
+    const s = subs.get(d[1]); if (!s) return;
+    if (d[0] === "EVENT" && d[2]) s.evs.push(d[2]);
+    else if (d[0] === "EOSE") s.done();
+  };
+  const req = (method, params, timeoutMs = 12000) => new Promise((resolve) => {
+    const sub = "pz" + Math.random().toString(36).slice(2, 9);
+    const evs = []; let fin = false;
+    const done = () => { if (fin) return; fin = true; clearTimeout(timer); subs.delete(sub); try { ws.send(JSON.stringify(["CLOSE", sub])); } catch {} resolve(evs); };
+    const timer = setTimeout(done, timeoutMs);
+    subs.set(sub, { evs, done });
+    try { ws.send(JSON.stringify(["REQ", sub, { cache: [method, params] }])); } catch { done(); }
+  });
+  const close = () => { try { ws.close(); } catch {} };
+  return { ready, req, close };
+}
+
+// 指定方向（sender=送信 / receiver=受信）の zap を primal からページング集計する。
+// user_zaps は 1 リクエスト 50 件程度なので直列だと遅い。primal は since/until を
+// サーバー側で解釈するため、時間範囲を N 分割して【各チャンクを並列ページング】し
+// 全体時間を短縮する。重複は zap_receipt_id でグローバル排除。専用接続 1 本で多重化。
+async function primalZapDir(hex, dirKey) {
+  const conn = openPrimal();
+  if (!conn) return null;
+  try {
+    await Promise.race([conn.ready, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
+    const seen = new Map();   // id -> { sats, t }
+    const now = Math.floor(Date.now() / 1000);
+    const floor = Math.floor(Date.parse("2021-01-01T00:00:00Z") / 1000);
+    const N = 8;
+    const step = Math.ceil((now - floor) / N);
+    const chunk = async (cSince, cUntil) => {
+      let until = cUntil;
+      for (let pg = 0; pg < 80; pg++) {
+        const evs = await conn.req("user_zaps", { [dirKey]: hex, since: cSince, until, limit: 1000 });
+        const recs = evs.filter((e) => e.kind === 10000129).map((e) => { try { return JSON.parse(e.content); } catch { return null; } }).filter(Boolean);
+        if (!recs.length) break;
+        let oldest = Infinity, fresh = 0;
+        for (const z of recs) {
+          const id = z.zap_receipt_id || z.event_id;
+          if (!seen.has(id)) { seen.set(id, { sats: Number(z.amount_sats) || 0, t: z.created_at }); fresh++; }
+          if (z.created_at < oldest) oldest = z.created_at;
+        }
+        if (fresh === 0 || !isFinite(oldest) || oldest <= cSince || oldest >= until) break;
+        until = oldest - 1;
+      }
+    };
+    const tasks = [];
+    for (let i = 0; i < N; i++) {
+      const cSince = Math.min(now, floor + step * i);
+      const cUntil = i === N - 1 ? now : Math.min(now, floor + step * (i + 1));
+      if (cUntil > cSince) tasks.push(chunk(cSince, cUntil));
+    }
+    await Promise.all(tasks);
+    let count = 0, sats = 0; const times = [];
+    for (const v of seen.values()) { count++; sats += v.sats; times.push(v.t); }
+    return { count, sats, times };
+  } catch {
+    return null;
+  } finally {
+    conn.close();
+  }
+}
+
+// primal の user_profile から受信 zap の権威集計（total_zap_count / total_satszapped）。
+// ページング合算はチャンクが途中終了すると取りこぼし得る（大口が欠けると合計が大きく
+// ズレる）ため、受信の件数・金額はこの集計値を使う（1 リクエストで正確）。
+async function primalProfileZaps(hex) {
+  const conn = openPrimal();
+  if (!conn) return null;
+  try {
+    await Promise.race([conn.ready, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 8000))]);
+    const prof = await conn.req("user_profile", { pubkey: hex });
+    const stat = prof.find((e) => e.kind === 10000105);
+    if (!stat) return null;
+    const j = JSON.parse(stat.content);
+    return { count: j.total_zap_count || 0, sats: j.total_satszapped || 0 };
+  } catch {
+    return null;
+  } finally {
+    conn.close();
+  }
+}
+
+// zap 送受信を primal（全ネットワーク index）から取得。3 接続を並列に走らせる：
+//  - 送信: user_zaps{sender} ページング（件数/金額/時系列。送信の集計 API は無い）
+//  - 受信時系列: user_zaps{receiver} ページング（グラフ用。多少の取りこぼしは shape に影響小）
+//  - 受信集計: user_profile（件数/金額の権威値。取りこぼさない）
+// primal が全滅なら null（リレー直クエリの #P/#p は receipt の 0.4% しか拾えず誤解を
+// 招くため zap のフォールバックには使わない＝取得不能として扱う）。
+async function fetchPrimalZaps(hex) {
+  const [sent, recvTimes, recvAgg] = await Promise.all([
+    primalZapDir(hex, "sender"),
+    primalZapDir(hex, "receiver"),
+    primalProfileZaps(hex),
+  ]);
+  if (!sent && !recvTimes && !recvAgg) return null;
+  const recv = recvAgg
+    ? { count: recvAgg.count, sats: recvAgg.sats, times: recvTimes?.times || [] }
+    : (recvTimes || null);   // 集計が取れなければページング値で代用
+  return { sent, recv };
 }
 
 let lastData = null; // 直近に描画したデータ（テーマ切替・再描画用）
@@ -38,7 +190,7 @@ function setStatus(msg, kind = "") {
 }
 
 // リレーごとの取得進捗をライブ表示する（複数プールの stats を URL で合算）。
-function renderRelayProgress(pools, done) {
+function renderRelayProgress(pools, done, walkState) {
   const el = document.getElementById("fetch-progress");
   if (!el) return;
   const byUrl = new Map();
@@ -52,10 +204,14 @@ function renderRelayProgress(pools, done) {
   const rows = [...byUrl.values()].map((r) => {
     const open = r.states.some((st) => st === "open");
     const allFailed = r.states.length && r.states.every((st) => st === "failed");
+    // 窓走査（最長処理）が始まって active が 0 に戻ったリレーは EOSE で取り切り＝完了。
+    const w = walkState && walkState.get(r.url);
+    const walkDone = w && w.started && w.active === 0;
+    const walking = w && w.active > 0;
     let label, cls;
     if (allFailed) { label = "接続失敗"; cls = "rs-fail"; }
-    else if (done) { label = r.events > 0 ? "完了" : "投稿なし"; cls = r.events > 0 ? "rs-ok" : "rs-empty"; }
-    else if (r.active > 0) { label = "取得中…"; cls = "rs-active"; }
+    else if (done || walkDone) { label = r.events > 0 ? "完了" : "投稿なし"; cls = r.events > 0 ? "rs-ok" : "rs-empty"; }
+    else if (r.active > 0 || walking) { label = "取得中…"; cls = "rs-active"; }
     else if (open) { label = "待機"; cls = "rs-idle"; }
     else { label = "接続中…"; cls = "rs-idle"; }
     const host = r.url.replace(/^wss?:\/\//, "");
@@ -351,7 +507,7 @@ async function findEarliest(pubkeyHex, pool, seedMin) {
     );
     if (!evs.length) { if (++empties >= 2) break; continue; }
     empties = 0;
-    const m = Math.min(...evs.map((e) => e.created_at));
+    const m = evs.reduce((mn, e) => e.created_at < mn ? e.created_at : mn, Infinity);
     if (m < earliest) earliest = m;
   }
 
@@ -363,7 +519,7 @@ async function findEarliest(pubkeyHex, pool, seedMin) {
       { timeoutMs: 7000 }
     );
     if (!evs.length) break;
-    const m = Math.min(...evs.map((e) => e.created_at));
+    const m = evs.reduce((mn, e) => e.created_at < mn ? e.created_at : mn, Infinity);
     if (m >= until) break;
     earliest = m;
     until = m;
@@ -374,7 +530,7 @@ async function findEarliest(pubkeyHex, pool, seedMin) {
 
 // ===== プロフィール＋実データ指標を取得（2フェーズ）=====
 // opts.useUserRelays: true なら対象の kind:10002 を取得先リレーにも合流させる。
-async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
+async function fetchProfile(pubkeyHex, { useUserRelays = false, fetchSince = null } = {}) {
   const t = pubkeyHex;
   const selected = getActiveRelays();
 
@@ -407,32 +563,86 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
   const streakPool = createPool(working);
 
   // リレーごとの取得進捗をライブ表示（200ms 間隔でポーリング描画）。
+  // walkState: 各リレーの「窓走査（メインの最長処理）」状態。started=一度でも走査開始、
+  // active=現在進行中の走査数。active が 0 に戻れば、そのリレーは EOSE で全窓を取り切り＝完了。
+  const walkState = new Map(working.map((u) => [u, { started: false, active: 0 }]));
   const progPools = [pool, streakPool];
-  renderRelayProgress(progPools, false);
-  const progTimer = setInterval(() => renderRelayProgress(progPools, false), 200);
+  renderRelayProgress(progPools, false, walkState);
+  const progTimer = setInterval(() => renderRelayProgress(progPools, false, walkState), 200);
 
   try {
   // --- Phase B: working リレーで本取得（過去も遡って集計）---
   // まず投稿の先頭ページを取り、利用開始推定の起点(seedMin)にする
   setStatus("Fetching activity, followers, and zaps through history…");
   const notes0 = await queryStable(pool, [{ kinds: [1], authors: [t], limit: 500 }], { timeoutMs: 8000 });
-  const seedMin = notes0.length ? Math.min(...notes0.map((e) => e.created_at)) : (meta ? meta.created_at : null);
+  const seedMin = notes0.length ? notes0.reduce((mn, e) => e.created_at < mn ? e.created_at : mn, Infinity) : (meta ? meta.created_at : null);
 
   // 最新投稿日（Streak ウォークの起点）
-  const latestTs = notes0.length ? Math.max(...notes0.map((e) => e.created_at)) : Math.floor(Date.now() / 1000);
+  const latestTs = notes0.length ? notes0.reduce((mx, e) => e.created_at > mx ? e.created_at : mx, 0) : Math.floor(Date.now() / 1000);
 
   // Communication 用：リアクション送受信は【直近30日】の同一窓で取る（件数打ち切りだと
   // 送信/受信でカバー期間がズレて比率が歪むため）。重量級ユーザーでも収まるようページ多め。
   const reactWindowDays = 30;
   const reactSince = Math.floor(Date.now() / 1000) - reactWindowDays * 86400;
 
-  // ページング取得（リレー上限を越えて過去も）＋最古推定＋NIP-05検証＋Streak を並列実行。
-  // ※ 取得はリレーごとの独立ページング（fetchAllPaged）なので、密度差による取りこぼしは無い。
-  const [noteEvents, followerEvents, zapRecvEvents, zapSentEvents, reactSentEvents, reactRecvEvents, repostSentEvents, repostRecvEvents, contactsEvents, sinceAt, nip05Verified, streakInfo] = await Promise.all([
-    fetchAllPaged({ kinds: [1], authors: [t] }, pool, { maxPages: 5 }),
+  // 全履歴取得：pool.queryOne を since/until で明示した 30 日窓で遡る。
+  // 無期限レンジ（{}）だとリレーが EOSE を送るタイミングを判断できずハングするが、
+  // 窓を区切れば各窓で確実に EOSE が返る（窓ごと queryStableOne が .complete を確認）。
+  // pool を共有するので進捗 UI（fetch-progress）が実際の取得状態をそのまま反映する。
+  // haijin-checker の設計に倣い、リレーごと独立・30 日窓を順に遡る・全リレー並列。
+  const NOSTR_FLOOR = Math.floor(Date.parse("2021-01-01T00:00:00Z") / 1000);
+  const sinceMin = fetchSince ?? NOSTR_FLOOR;
+  const WINDOW_SEC = 30 * 86400;   // 30 日窓
+  const WIN_TIMEOUT = 12000;       // 1 窓あたり最大 12 秒（EOSE 中央値 60ms・最大 8s なので十分）
+  const RELAY_TIMEOUT = 240000;    // リレー 1 本あたり最大 4 分
+
+  const fetchInWindows = async (filter) => {
+    const evs = new Map();
+    const now = Math.floor(Date.now() / 1000);
+
+    const PAGE_LIMIT = 500;   // リレーの 1 REQ あたり返却上限の目安
+    const runRelay = async (relayUrl) => {
+      const st = walkState.get(relayUrl);
+      if (st) { st.started = true; st.active++; }
+      const deadline = Date.now() + RELAY_TIMEOUT;
+      try {
+        for (let wUntil = now; wUntil > sinceMin; wUntil -= WINDOW_SEC) {
+          const wSince = Math.max(sinceMin, wUntil - WINDOW_SEC);
+          if (Date.now() >= deadline) break;
+          // 窓内を until で遡ってページング：密な窓（>PAGE_LIMIT）でも全件取り切る。
+          // limit 未指定だとリレー既定（~500）で EOSE し打ち切られるため limit を明示。
+          let pageUntil = wUntil;
+          for (let guard = 0; guard < 200; guard++) {
+            if (Date.now() >= deadline) break;
+            const f = { ...filter, since: wSince, until: pageUntil, limit: PAGE_LIMIT };
+            const evArr = await queryStableOne(pool, relayUrl, [f], { timeoutMs: WIN_TIMEOUT, retries: 1 });
+            let oldest = Infinity;
+            for (const ev of evArr) { evs.set(ev.id, ev); if (ev.created_at < oldest) oldest = ev.created_at; }
+            // 取得数が上限未満 = この窓は取り切った。境界の取りこぼしを防ぐため
+            // pageUntil は oldest（-1 しない）にし、重複は id 重複排除で吸収する。
+            if (evArr.length < PAGE_LIMIT || !isFinite(oldest) || oldest <= wSince) break;
+            pageUntil = oldest;
+          }
+        }
+      } finally {
+        if (st) st.active--;   // この窓走査が終わった（active が 0 に戻れば完了表示へ）
+      }
+    };
+
+    await Promise.allSettled(working.map(relayUrl => runRelay(relayUrl)));
+    return [...evs.values()];
+  };
+
+  // zap 集計は primal（全ネットワーク index）から並行取得。リレー取得と同時に走らせる。
+  const primalP = fetchPrimalZaps(t).catch(() => null);
+
+  // zap（kind:9735）はリレー直クエリでは正確に取れない（送信は #P タグが receipt の
+  // 0.4% にしか付かず、受信も相手リレーに散る）ため、primal（全ネットワーク index）に
+  // 一本化した。リレーからの zap 窓走査は冗長＋ pool 帯域を圧迫して他取得まで遅くする
+  // ので【完全に廃止】。zap は上で並行起動した primalP からのみ取得する。
+  const [noteEvents, followerEvents, reactSentEvents, reactRecvEvents, repostSentEvents, repostRecvEvents, contactsEvents, sinceAt, nip05Verified, streakInfo] = await Promise.all([
+    fetchInWindows({ kinds: [1], authors: [t] }),
     fetchAllPaged({ kinds: [3], "#p": [t] }, pool, { maxPages: 3 }),
-    fetchAllPaged({ kinds: [9735], "#p": [t] }, pool, { maxPages: 6 }), // Zap 受信
-    fetchAllPaged({ kinds: [9735], "#P": [t] }, pool, { maxPages: 6 }), // Zap 送信（大文字 P）
     fetchAllPaged({ kinds: [7], authors: [t], since: reactSince }, pool, { maxPages: 6 }), // リアクション送信（直近30日）
     fetchAllPaged({ kinds: [7], "#p": [t], since: reactSince }, pool, { maxPages: 6 }),    // リアクション受信（直近30日）
     fetchAllPaged({ kinds: [6], authors: [t], since: reactSince }, pool, { maxPages: 6 }), // リポスト送信（直近30日）
@@ -457,9 +667,18 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     try { relayCount = Object.keys(JSON.parse(contactsEv.content || "{}")).length; } catch {}
   }
 
-  // Zap 件数（送受信を分離。重複は id で除去済み）
-  const zapRecv = zapRecvEvents.length;
-  const zapSent = zapSentEvents.length;
+  // Zap 集計は primal（全ネットワーク index＝正確）に一本化。relay 取得と並行で
+  // 走らせており（primalP は Promise.all の前に起動済み）、ここで結果を待ち合わせる。
+  // primal が落ちていれば zap は取得不能（0／source=unavailable）として正直に扱う。
+  const primalZ = await primalP;
+  const zapRecv = primalZ?.recv ? primalZ.recv.count : 0;
+  const zapRecvSats = primalZ?.recv ? primalZ.recv.sats : 0;
+  const zapSent = primalZ?.sent ? primalZ.sent.count : 0;
+  const zapSentSats = primalZ?.sent ? primalZ.sent.sats : 0;
+  const zapSource = primalZ ? "primal" : "unavailable";
+  // グラフ用の zap 時系列（best-effort・サニタイズ済）。primal が無ければ空。
+  const zapRecvTimesSrc = (primalZ?.recv?.times || []).filter(saneSec);
+  const zapSentTimesSrc = (primalZ?.sent?.times || []).filter(saneSec);
 
   // Communication（直近30日・活動量ベース）。日本の Nostr はタグ無しエアリプで会話する
   // ため、構造的に拾える「リアクション/リポストの送受信」だけだと会話量を取りこぼす。
@@ -502,13 +721,15 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
     about: profile.about || "",
     hasNip05: !!profile.nip05,
     // 実データ指標
-    activity: noteEvents.length,        // 投稿数（ページ収集後）
-    activityCapped: noteEvents.length >= 2500,
+    activity: noteEvents.length,        // 投稿数（nostr-fetchで全件取得）
+    activityCapped: false,              // nostr-fetchはリレー保持分を全件取るのでcapなし
     followers: followers.size,
     following: followList.size,
     relayCount,
     zapRecv,
     zapSent,
+    zapRecvSats,
+    zapSentSats,
     reactionsSent,
     reactionsRecv,
     repostSent,
@@ -530,15 +751,21 @@ async function fetchProfile(pubkeyHex, { useUserRelays = false } = {}) {
       // ノートが実際にカバーした期間】で割り、最近の投稿ペースを推定する。
       if (!noteEvents.length) return 0;
       const ts = noteEvents.map((e) => e.created_at);
-      const spanDays = (Math.max(...ts) - Math.min(...ts)) / 86400;
+      const spanDays = (ts.reduce((mx, v) => v > mx ? v : mx, 0) - ts.reduce((mn, v) => v < mn ? v : mn, Infinity)) / 86400;
       return noteEvents.length / Math.max(spanDays, 0.5);
     })(),
     peakUTC: peakBand(noteEvents.map((e) => e.created_at)),  // 最も活発な時間帯
+    // 裏面グラフ用：取れた範囲のタイムスタンプ（best-effort・サニタイズ済）。
+    fetchSince,   // グラフのx軸開始点（null = 全件）
+    noteTimes: noteEvents.map((e) => e.created_at).filter(saneSec),
+    zapRecvTimes: zapRecvTimesSrc,
+    zapSentTimes: zapSentTimesSrc,
+    zapSource,
     usedRelays: working,
   };
   } finally {
     clearInterval(progTimer);
-    renderRelayProgress(progPools, true);   // 最終スナップショット（完了表示）
+    renderRelayProgress(progPools, true, walkState);   // 最終スナップショット（完了表示）
     pool.close();
     streakPool.close();
   }
@@ -1506,6 +1733,169 @@ async function renderCard(d, theme = "jp") {
   if (pb) pb.disabled = false;
 }
 
+// ===== 裏面（ACTIVITY RECORD）: 取れた範囲の週次グラフ＋統計を免許証の裏風に =====
+// グラフ3系列の色（白地でもダーク地でも読める）。投稿=青 / Zap受信=琥珀⚡ / Zap送信=緑↗
+const NCHART = { post: "#3b82f6", zapR: "#f59e0b", zapS: "#22c55e" };
+function pctOf(a, b) { return b ? Math.round(100 * a / b) + "%" : "—"; }
+
+// Code128(コードセットB) — ハンドル/npub を実エンコード（スキャンで読める）
+const _C128 = ["212222","222122","222221","121223","121322","131222","122213","122312","132212","221213","221312","231212","112232","122132","122231","113222","123122","123221","223211","221132","221231","213212","223112","312131","311222","321122","321221","312212","322112","322211","212123","212321","232121","111323","131123","131321","112313","132113","132311","211313","231113","231311","112133","112331","132131","113123","113321","133121","313121","211331","231131","213113","213311","213131","311123","311321","331121","312113","312311","332111","314111","221411","431111","111224","111422","121124","121421","141122","141221","112214","112412","122114","122411","142112","142211","241211","221114","413111","241112","134111","111242","121142","121241","114212","124112","124211","411212","421112","421211","212141","214121","412121","111143","111341","131141","114113","114311","411113","411311","113141","114131","311141","411131","211412","211214","211232","2331112"];
+function _code128B(text) {
+  const codes = [104]; let sum = 104, pos = 1;
+  for (let i = 0; i < text.length; i++) { const v = text.charCodeAt(i) - 32; if (v < 0 || v > 95) continue; codes.push(v); sum += v * pos; pos++; }
+  codes.push(sum % 103); codes.push(106);
+  return codes.map((v) => _C128[v]);
+}
+function drawBarcode(c, text, x, y, h, color, { mod = 3, maxW = 1000 } = {}) {
+  const pats = _code128B(String(text || "")); const quiet = 10;
+  let total = quiet * 2; for (const p of pats) for (const ch of p) total += +ch;
+  const mw = Math.min(mod, maxW / total);
+  c.save(); c.fillStyle = color; let cx = x + quiet * mw;
+  for (const p of pats) for (let k = 0; k < p.length; k++) { const ww = (+p[k]) * mw; if (k % 2 === 0) c.fillRect(cx, y, ww, h); cx += ww; }
+  c.restore(); return total * mw;
+}
+
+// 週次集計（best-effort・取れた範囲）。posts/zapR/zapS の3系列
+function nWeekly(d) {
+  const W = 604800;
+  const now = Math.floor(Date.now() / 1000);
+  const posts = d.noteTimes || [], zR = d.zapRecvTimes || [], zS = d.zapSentTimes || [];
+  // グラフのx軸範囲は「投稿(posts)が最初に取れた時点〜今日」にする。
+  // zapはposts/zapsで取得深度が違うため、zap最古を基準にするとposts空白の期間が大量に生まれる。
+  // posts が主軸なので posts の範囲に合わせ、zapはその期間内だけ表示する。
+  if (!posts.length && !zR.length && !zS.length) return { n: 0 };
+  const postMin = posts.length ? posts.reduce((mn, v) => v < mn ? v : mn, Infinity) : Infinity;
+  const zapAll = [...zR, ...zS];
+  const zapMin  = zapAll.length ? zapAll.reduce((mn, v) => v < mn ? v : mn, Infinity) : Infinity;
+  // posts があれば posts 基準、なければ zap 基準
+  const mn = isFinite(postMin) ? postMin : zapMin;
+  if (!isFinite(mn)) return { n: 0 };
+  const mx = now;
+  // RETRIEVED RANGE ラベル用の実データ最古・最新
+  let dataMin = mn, dataMax = 0;
+  for (const arr of [posts, zR, zS]) for (const t of arr) { if (t < dataMin) dataMin = t; if (t > dataMax) dataMax = t; }
+  const start = Math.floor(mn / W) * W, end = Math.floor(mx / W) * W;
+  const n = Math.floor((end - start) / W) + 1;
+  const mk = (arr) => { const a = new Array(n).fill(0); for (const t of arr) { const wi = Math.floor((t - start) / W); if (wi >= 0 && wi < n) a[wi]++; } return a; };
+  return { posts: mk(posts), zapR: mk(zR), zapS: mk(zS), n, weekSec: W, start, first: dataMin, last: dataMax };
+}
+
+// 裏面の地紋：表（直交）とは違う【対角の織り地】＋ギロシェ
+function drawBackBg(c, t, W, H) {
+  const off = document.createElement("canvas"); off.width = W; off.height = H;
+  const g = off.getContext("2d"); g.lineCap = "round"; g.lineJoin = "round";
+  g.save(); g.translate(W / 2, H / 2); g.rotate(Math.PI / 4);
+  const D = Math.ceil((W + H) / 1.3); let ri = 0;
+  for (let i = -D; i <= D; i += 12.4) { g.strokeStyle = (ri++ % 2) ? t.line : t.accent; g.lineWidth = 1; g.beginPath(); for (let x = -D; x <= D; x += 5) { const y2 = i + Math.sin(x / 44 + i * 0.04) * 7 + Math.sin(x / 128) * 5 + Math.cos(x / 320) * 3; x === -D ? g.moveTo(x, y2) : g.lineTo(x, y2); } g.stroke(); }
+  let rj = 0;
+  for (let j = -D; j <= D; j += 31) { g.strokeStyle = (rj++ % 2) ? t.accent : t.line; g.lineWidth = 1; g.beginPath(); for (let y = -D; y <= D; y += 6) { const x2 = j + Math.sin(y / 50) * 6 + Math.sin(y / 150) * 4; y === -D ? g.moveTo(x2, y) : g.lineTo(x2, y); } g.stroke(); }
+  g.restore();
+  guilloche(g, W * 0.78, H * 0.26, 300, 90, 8, 28, t.accent, 1, 1);
+  guilloche(g, W * 0.78, H * 0.26, 190, 64, 13, 24, t.accent2, 1, 1);
+  guilloche(g, W * 0.24, H * 0.64, 260, 80, 11, 26, t.accent2, 1, 1);
+  guilloche(g, W * 0.24, H * 0.64, 160, 56, 16, 22, t.accent, 1, 1);
+  for (const [px, py] of [[110, 120], [W - 120, 120], [120, H - 110], [W - 120, H - 110]]) guilloche(g, px, py, 64, 24, 13, 18, t.accent2, 1, 1);
+  g.globalCompositeOperation = "destination-out";
+  const fade = g.createLinearGradient(0, 0, 0, H); fade.addColorStop(0, "rgba(0,0,0,0)"); fade.addColorStop(1, "rgba(0,0,0,0.5)");
+  g.fillStyle = fade; g.fillRect(0, 0, W, H); g.globalCompositeOperation = "source-over";
+  c.save(); c.globalAlpha = t.dark ? 0.32 : 0.20; c.drawImage(off, 0, 0); c.restore();
+}
+
+function drawBackChart(c, d, t, x, y, w, h) {
+  const s = nWeekly(d);
+  c.save();
+  c.fillStyle = t.dark ? "#181530" : "#ffffff"; roundRect(c, x, y, w, h, 12); c.fill();
+  c.globalAlpha = 0.6; c.strokeStyle = t.line; c.lineWidth = 1; roundRect(c, x, y, w, h, 12); c.stroke(); c.globalAlpha = 1;
+  if (!s.n) {
+    c.fillStyle = t.sub; c.textAlign = "center"; c.textBaseline = "middle"; c.font = "600 20px 'Hiragino Sans',sans-serif";
+    c.fillText("no retrievable activity", x + w / 2, y + h / 2); c.restore(); return;
+  }
+  const padX = 16, padY = 30, plotW = w - padX * 2, plotH = h - padY - 26, ox = x + padX, oy = y + padY;
+  const xOf = (wi) => ox + (s.n <= 1 ? plotW / 2 : (wi / (s.n - 1)) * plotW);
+  // 系列ごとに自分の最小〜最大の幅で正規化する（共通スケールだと投稿に対して
+  // zap が潰れて見えなくなるため）。min をその系列の底、max を天井に割り当てる。
+  const line = (arr, col, lw) => {
+    let mn = Infinity, mx = -Infinity;
+    for (const v of arr) { if (v < mn) mn = v; if (v > mx) mx = v; }
+    if (!isFinite(mn)) { mn = 0; mx = 0; }
+    const span = (mx - mn) || 1;
+    const yOf = (v) => oy + plotH - ((v - mn) / span) * plotH;
+    c.strokeStyle = col; c.lineWidth = lw; c.beginPath();
+    for (let wi = 0; wi < s.n; wi++) { const X = xOf(wi), Y = yOf(arr[wi]); wi ? c.lineTo(X, Y) : c.moveTo(X, Y); }
+    c.stroke();
+  };
+  line(s.zapR, NCHART.zapR, 1.5); line(s.zapS, NCHART.zapS, 1.5); line(s.posts, NCHART.post, 2);
+  const ink = t.dark ? "#cfd2f5" : t.sub;
+  c.fillStyle = ink; c.font = "600 15px 'Hiragino Sans',sans-serif"; c.textBaseline = "alphabetic"; c.textAlign = "center";
+  let ly = null; for (let wi = 0; wi < s.n; wi++) { const yr = new Date((s.start + wi * s.weekSec) * 1000).getUTCFullYear(); if (yr !== ly) { ly = yr; c.fillText(String(yr), xOf(wi), y + h - 8); } }
+  c.textAlign = "left";
+  let lx = x + 16; for (const [col, lbl] of [[NCHART.post, "posts"], [NCHART.zapR, "zap in"], [NCHART.zapS, "zap out"]]) { c.fillStyle = col; c.fillRect(lx, y + 12, 12, 12); c.fillStyle = ink; c.fillText(lbl, lx + 16, y + 23); lx += 34 + c.measureText(lbl).width; }
+  c.restore();
+}
+
+function renderBack(d, theme = "jp") {
+  const cv = document.getElementById("back-canvas");
+  if (!cv) return;
+  const t = THEMES[theme] || THEMES.jp;
+  const c = cv.getContext("2d");
+  const W = cv.width, H = cv.height, PAD = 56;
+  c.clearRect(0, 0, W, H); c.lineCap = "round"; c.lineJoin = "round";
+  const bg = c.createLinearGradient(0, 0, W, H);
+  bg.addColorStop(0, t.paper[0]); bg.addColorStop(0.5, t.paper[1]); bg.addColorStop(1, t.paper[2]);
+  roundRect(c, 0, 0, W, H, 24); c.fillStyle = bg; c.fill();
+  c.save(); roundRect(c, 0, 0, W, H, 24); c.clip();
+  drawBackBg(c, t, W, H);
+  const sheen = c.createLinearGradient(0, H, W, 0);
+  sheen.addColorStop(0.3, "rgba(255,255,255,0)"); sheen.addColorStop(0.5, t.dark ? "rgba(150,130,255,0.10)" : "rgba(170,200,255,0.12)"); sheen.addColorStop(0.7, "rgba(255,255,255,0)");
+  c.fillStyle = sheen; c.fillRect(0, 0, W, H);
+  c.restore();
+  c.lineWidth = 5; c.strokeStyle = t.border; roundRect(c, 10, 10, W - 20, H - 20, 20); c.stroke();
+  // 磁気ストライプ風
+  c.fillStyle = "#15131f"; c.fillRect(34, 58, W - 68, 92);
+  c.fillStyle = "rgba(255,255,255,0.6)"; c.textBaseline = "middle"; c.textAlign = "left";
+  c.font = "700 22px 'Hiragino Sans',sans-serif"; c.fillText("NOSTR LICENSE · DATA STRIPE", PAD, 104);
+  c.textAlign = "right"; c.font = "600 18px 'SF Mono','Menlo',monospace"; c.fillText((d.npub || "").slice(0, 24) + "…", W - PAD, 104);
+  // ヘッダ
+  c.textBaseline = "alphabetic"; c.textAlign = "left";
+  c.fillStyle = t.ink; c.font = "800 44px 'Hiragino Sans',sans-serif"; c.fillText("ACTIVITY RECORD", PAD, 214);
+  c.fillStyle = t.sub; c.font = "600 25px 'Hiragino Sans',sans-serif"; c.fillText(d.name + (d.handle ? "  @" + d.handle : ""), PAD, 250);
+  c.textAlign = "right"; c.fillStyle = t.sub; c.font = "600 22px 'Hiragino Sans',sans-serif"; c.fillText("NO. " + licenseNo(d), W - PAD, 214);
+  // RETRIEVED（取れた範囲＝best-effort）
+  const s = nWeekly(d);
+  const dd = (sec) => sec ? fmtISO(sec) : "—";
+  c.textAlign = "left"; c.fillStyle = t.sub; c.font = "700 22px 'Hiragino Sans',sans-serif"; c.fillText("RETRIEVED RANGE (best-effort)", PAD, 296);
+  c.fillStyle = t.accent2; c.font = "800 28px 'SF Mono','Menlo','Consolas',monospace"; c.fillText(s.n ? dd(s.first) + "  〜  " + dd(s.last) : "—", PAD, 332);
+  // 週次チャート
+  drawBackChart(c, d, t, PAD, 356, W - PAD * 2, 226);
+  // 統計グリッド 3×3
+  const days = new Set((d.noteTimes || []).map((x) => Math.floor(x / 86400)));
+  const dayCount = new Map(); for (const x of (d.noteTimes || [])) { const k = Math.floor(x / 86400); dayCount.set(k, (dayCount.get(k) || 0) + 1); }
+  let bDay = null, bN = 0; for (const [k, n] of dayCount) if (n > bN) { bN = n; bDay = k; }
+  const cap = (v, f) => (v || 0).toLocaleString() + (f ? "+" : "");
+  const grid = [
+    ["POSTS", cap(d.activity, d.activityCapped)],
+    ["LONGEST STREAK", (d.streak || 0) + " d" + (d.streakCapped ? "+" : "")],
+    ["ACTIVE DAYS", cap(days.size) + " (seen)"],
+    ["AVG PACE", (d.velocity || 0).toFixed(1) + " /day"],
+    ["ZAP RECEIVED", "⚡" + cap(d.zapRecvSats) + "  (" + cap(d.zapRecv) + ")"],
+    ["ZAP SENT", "⚡" + cap(d.zapSentSats) + "  (" + cap(d.zapSent) + ")"],
+    ["WEB OF TRUST", cap(d.wotValue)],
+    ["PEAK (UTC)", d.peakUTC || "—"],
+    ["BUSIEST DAY", bDay ? fmtISO(bDay * 86400) + "  ·  " + bN : "—"],
+  ];
+  const gy0 = 648, rowH = 80, colW = (W - PAD * 2) / 3;
+  for (let i = 0; i < grid.length; i++) {
+    const gx = PAD + (i % 3) * colW, gy = gy0 + Math.floor(i / 3) * rowH;
+    c.textAlign = "left"; c.fillStyle = t.sub; c.font = "700 18px 'Hiragino Sans',sans-serif"; c.fillText(grid[i][0], gx, gy);
+    c.fillStyle = t.ink; c.font = "700 26px 'Hiragino Sans',sans-serif"; c.fillText(grid[i][1], gx, gy + 32);
+    c.strokeStyle = t.gold2; c.globalAlpha = 0.22; c.lineWidth = 1; c.beginPath(); c.moveTo(gx, gy + 46); c.lineTo(gx + colW - 34, gy + 46); c.stroke(); c.globalAlpha = 1;
+  }
+  // バーコード（npub を Code128 で実エンコード・ラベル無し = スキャンしてからのお楽しみ）
+  // npub は63文字と長いので maxW をホロシール左端手前で止める
+  drawBarcode(c, d.npub || "", PAD, H - 100, 52, t.ink, { mod: 2.4, maxW: W - PAD * 2 - 160 });
+  drawHoloSeal(c, W - 92, H - 74, 40);
+}
+
 // ===== 発行フロー（取得元が NIP-07 でも手入力でも完全に同じ処理）=====
 async function issueFor(pubkeyHex) {
   try {
@@ -1513,7 +1903,9 @@ async function issueFor(pubkeyHex) {
       throw new Error("Specify at least one relay");
     }
     const useUserRelays = $("use-user-relays").checked;
-    const data = await fetchProfile(pubkeyHex, { useUserRelays });
+    const rangeDays = parseInt($("fetch-range").value, 10);
+    const fetchSince = rangeDays > 0 ? Math.floor(Date.now() / 1000) - rangeDays * 86400 : null;
+    const data = await fetchProfile(pubkeyHex, { useUserRelays, fetchSince });
     setStatus("Generating avatar / QR…");
     const [avatar, qr] = await Promise.all([
       loadAvatar(data.picture),
@@ -1524,11 +1916,13 @@ async function issueFor(pubkeyHex) {
     lastData = data;
 
     await renderCard(data, $("theme-select").value);
+    const back = document.getElementById("back-canvas");
+    if (back) { back.hidden = false; renderBack(data, $("theme-select").value); }   // 裏面（ACTIVITY RECORD）
     const nip05State = !data.nip05 ? "" :
       data.nip05Verified === true ? " / NIP-05 ✓verified" :
       data.nip05Verified === false ? " / NIP-05 ✗mismatch" : " / NIP-05 unverifiable";
     setStatus(
-      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / vel ${(data.velocity || 0).toFixed(1)}/d / streak ${data.streak}d${data.streakCapped ? "+" : ""} / comm ${data.postsRecent}p+${data.interactions}i (react ${data.reactionsSent}→/←${data.reactionsRecv}, rt ${data.repostSent}→/←${data.repostRecv}, 30d) / peak ${data.peakUTC} / zap recv ⚡${data.zapRecv} sent ⚡${data.zapSent}${nip05State}`,
+      `Done: ${data.name} | posts ${data.activity}${data.activityCapped ? "+" : ""} / WoT ${data.wotValue} / vel ${(data.velocity || 0).toFixed(1)}/d / streak ${data.streak}d${data.streakCapped ? "+" : ""} / comm ${data.postsRecent}p+${data.interactions}i (react ${data.reactionsSent}→/←${data.reactionsRecv}, rt ${data.repostSent}→/←${data.repostRecv}, 30d) / peak ${data.peakUTC} / zap[${data.zapSource}] recv ⚡${(data.zapRecvSats || 0).toLocaleString()}(${data.zapRecv}) sent ⚡${(data.zapSentSats || 0).toLocaleString()}(${data.zapSent})${nip05State}`,
       "ok"
     );
     refreshShareCaption();   // 解析数値を下のシェア用テキストボックスへ反映
@@ -1575,7 +1969,11 @@ $("manual-btn").addEventListener("click", async () => {
 });
 
 $("theme-select").addEventListener("change", () => {
-  if (lastData) renderCard(lastData, $("theme-select").value);
+  if (lastData) {
+    const theme = $("theme-select").value;
+    renderCard(lastData, theme);
+    if (lastData.noteTimes) renderBack(lastData, theme);
+  }
 });
 
 // ===== アイコン正方形表示トグル =====
@@ -1640,11 +2038,19 @@ DEFAULT_RELAYS.forEach((r) => addRelayRow(r));
 
 $("download-btn").addEventListener("click", () => {
   try {
-    const url = canvas.toDataURL("image/png");
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "nostr-license.png";
-    a.click();
+    const back = document.getElementById("back-canvas");
+    if (back && !back.hidden) {
+      // 表裏を縦に並べて1枚のPNGに結合（表 → 裏）
+      const out = document.createElement("canvas");
+      out.width = canvas.width; out.height = canvas.height * 2 + 32;
+      const oc = out.getContext("2d");
+      oc.fillStyle = "#0c1015"; oc.fillRect(0, 0, out.width, out.height);
+      oc.drawImage(canvas, 0, 0);
+      oc.drawImage(back, 0, canvas.height + 32);
+      const a = document.createElement("a"); a.href = out.toDataURL("image/png"); a.download = "nostr-license.png"; a.click();
+    } else {
+      const a = document.createElement("a"); a.href = canvas.toDataURL("image/png"); a.download = "nostr-license.png"; a.click();
+    }
   } catch (err) {
     setStatus("Download failed (possible avatar CORS restriction): " + err.message, "error");
   }
